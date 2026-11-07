@@ -11,6 +11,7 @@
 //! These files are freely downloadable over HTTPS (no AWS credentials needed),
 //! so this module provides the app with a ready-made example source to open.
 
+use crate::commands::portal_http;
 use crate::commands::progress;
 use crate::commands::transfers as xfers;
 use crate::qpx::ViewInfo;
@@ -103,7 +104,7 @@ fn cache_root() -> Result<PathBuf, String> {
 }
 
 async fn get_html(url: &str) -> Result<String, String> {
-    let client = Client::builder().build().map_err(|e| e.to_string())?;
+    let client = portal_http::client_builder()?.build().map_err(|e| format!("portal HTTP client: {e:?}"))?;
     let resp = client
         .get(url)
         .header("Accept", "text/html")
@@ -282,7 +283,7 @@ struct DatasetSearchPage {
 #[tauri::command]
 pub async fn portal_registry(page_size: Option<usize>) -> Result<Vec<PortalDataset>, String> {
     let page_size = page_size.unwrap_or(50).clamp(1, 100);
-    let client = Client::builder().build().map_err(|e| e.to_string())?;
+    let client = portal_http::client_builder()?.build().map_err(|e| format!("portal HTTP client: {e:?}"))?;
 
     async fn get_page(
         client: &Client,
@@ -298,7 +299,7 @@ pub async fn portal_registry(page_size: Option<usize>) -> Result<Vec<PortalDatas
                     },
                     Err(e) => last = format!("http: {e}"),
                 },
-                Err(e) => last = format!("request: {e}"),
+                Err(e) => last = format!("request: {e:?}"),
             }
         }
         Err(format!("{url}: {last}"))
@@ -491,7 +492,7 @@ async fn pick_run(
     if runs.len() == 1 {
         return Ok(runs[0].clone());
     }
-    let client = Client::builder().build().map_err(|e| e.to_string())?;
+    let client = portal_http::client_builder()?.build().map_err(|e| format!("portal HTTP client: {e:?}"))?;
     let fetches = runs.into_iter().map(|run| {
         let client = client.clone();
         let url = format!("{ds_url}{run}/provenance.json");
@@ -523,7 +524,7 @@ async fn portal_cache_views_impl(
     cancel_id: String,
     urls: Vec<String>,
 ) -> Result<Vec<ViewInfo>, String> {
-    let client = Client::builder().build().map_err(|e| e.to_string())?;
+    let client = portal_http::client_builder()?.build().map_err(|e| format!("portal HTTP client: {e:?}"))?;
     let root = cache_root()?;
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
 
@@ -895,4 +896,3 @@ mod tests {
         assert!(views.iter().any(|v| v.size_bytes > 0));
     }
 }
-

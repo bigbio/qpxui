@@ -15,6 +15,7 @@
 //! URLs carry a random per-session token so other local processes can't use
 //! the proxy to read the user's buckets.
 
+use crate::commands::portal_http;
 use crate::commands::s3::client_for_bucket;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
@@ -483,10 +484,10 @@ pub async fn register(bucket: &str, paths: &[String]) -> Result<BTreeMap<String,
 /// 1-byte range GET is made per file, to learn its size; data is fetched lazily.
 pub async fn register_http(urls: &[String]) -> Result<BTreeMap<String, StreamHandle>, String> {
     let p = proxy().await?;
-    let client = reqwest::Client::builder()
+    let client = portal_http::client_builder()?
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("portal HTTP client: {e:?}"))?;
     let mut out = BTreeMap::new();
     for url in urls {
         // Only the quantms portal: the proxy must not fetch arbitrary hosts.
