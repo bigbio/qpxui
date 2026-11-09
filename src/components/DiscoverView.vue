@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api, portalRef, type PortalDataset, type PortalFacets, type PortalSearchResult } from "../lib/api";
 import { fmtCount, fmtBytes } from "../lib/format";
 import PortalViews from "./PortalViews.vue";
 import PeptideSearchPane from "./PeptideSearchPane.vue";
+import { buildInstrumentTree, ontologyName, selectedInstruments, type InstrumentTerm } from "../lib/ontology";
+import { enrichPortalMethods, methodTypes } from "../lib/portalMethods";
+import InstrumentFilter from "./InstrumentFilter.vue";
+import PortalMethods from "./PortalMethods.vue";
 
 type Tab = "datasets" | "peptides";
 const TABS: { key: Tab; label: string }[] = [
@@ -21,6 +25,24 @@ const results = ref<PortalSearchResult>({ datasets: [], total: 0, page: 1, total
 const q = ref("");
 const organism = ref("");
 const instrument = ref("");
+const quantification = ref("");
+const acquisition = ref("");
+const methodsLoading = ref(true);
+const methodsError = ref("");
+const methodCatalogue = ref<PortalDataset[]>([]);
+const quantificationTypes = computed(() => [...new Set(methodCatalogue.value.flatMap((ds) => methodTypes(ds.quantificationTypes)))].sort());
+const acquisitionTypes = computed(() => [...new Set(methodCatalogue.value.flatMap((ds) => methodTypes(ds.acquisitionTypes)))].sort());
+const metadataWarnings = computed(() => methodCatalogue.value.filter((ds) => ds.metadataError).length);
+const instrumentTerms = ref<InstrumentTerm[]>([]);
+const ontologyLoading = ref(true);
+const ontologyError = ref("");
+const instrumentTree = computed(() => buildInstrumentTree(instrumentTerms.value, facets.value.instruments));
+let unmounted = false;
+onBeforeUnmount(() => {
+  unmounted = true;
+  searchSeq++;
+  window.clearTimeout(searchTimer);
+});
 const collection = ref("");
 const sort = ref("peptides");
 const page = ref(1);
@@ -50,13 +72,16 @@ async function load() {
     const res = await api.portalSearch(q.value.trim() || null, {
       collection: collection.value || null,
       organism: organism.value || null,
-      instrument: instrument.value || null,
+      instruments: selectedInstruments(instrumentTree.value, instrument.value),
+      quantification: quantification.value || null,
+      acquisition: acquisition.value || null,
       sort: sort.value || null,
       page: page.value,
       pageSize: PAGE_SIZE,
     });
     if (id !== searchSeq) return;
     results.value = res;
+    page.value = res.page;
     // Close the expanded dataset (and so cancel its download) if it is no
     // longer on this page.
     if (selected.value) {
@@ -71,6 +96,10 @@ async function load() {
     if (id === searchSeq) busy.value = false;
   }
 }
+
+watch(instrumentTree, () => {
+  if (instrument.value) changeFilter();
+});
 
 function changeFilter() {
   page.value = 1;
@@ -94,6 +123,8 @@ function clearFilters() {
   q.value = "";
   organism.value = "";
   instrument.value = "";
+  quantification.value = "";
+  acquisition.value = "";
   collection.value = "";
   sort.value = "peptides";
   page.value = 1;
@@ -114,7 +145,30 @@ function doiUrl(doi: string): string {
 onMounted(() => {
   api.portalFacets().then((f) => (facets.value = f)).catch((e) => (facetsError.value = String(e?.message ?? e)));
   load();
+  api.portalInstrumentTerms()
+    .then((terms) => { if (!unmounted) instrumentTerms.value = terms; })
+    .catch((e: unknown) => { if (!unmounted) ontologyError.value = `Instrument hierarchy unavailable: ${String(e)}`; })
+    .finally(() => { if (!unmounted) ontologyLoading.value = false; });
+  void loadMethods();
 });
+
+async function loadMethods() {
+  methodsLoading.value = true;
+  methodsError.value = "";
+  try {
+    methodCatalogue.value = await api.portalRegistry();
+    if (unmounted) return;
+    await enrichPortalMethods(methodCatalogue.value, api.portalMethodMetadata, (metadata) => {
+      for (const dataset of results.value.datasets) {
+        if (dataset.datasetRef && metadata[dataset.datasetRef]) Object.assign(dataset, metadata[dataset.datasetRef]);
+      }
+    }, () => !unmounted);
+  } catch (e: unknown) {
+    if (!unmounted) methodsError.value = `Method filters unavailable: ${String(e)}`;
+  } finally {
+    if (!unmounted) methodsLoading.value = false;
+  }
+}
 
 const hasPrev = computed(() => page.value > 1);
 const hasNext = computed(() => page.value < results.value.totalPages);
@@ -158,9 +212,14 @@ const hasNext = computed(() => page.value < results.value.totalPages);
         <option value="">Any organism</option>
         <option v-for="o in facets.organisms" :key="o" :value="o">{{ o }}</option>
       </select>
-      <select v-model="instrument" class="sel" @change="changeFilter">
-        <option value="">Any instrument</option>
-        <option v-for="i in facets.instruments" :key="i" :value="i">{{ i }}</option>
+      <InstrumentFilter v-model="instrument" :tree="instrumentTree" :loading="ontologyLoading" :error="ontologyError" @change="changeFilter" />
+      <select v-model="quantification" class="sel" :disabled="methodsLoading || !!methodsError" aria-label="Quantification type" title="Quantification family derived from sample labels" @change="changeFilter">
+        <option value="">Any quantification</option>
+        <option v-for="type in quantificationTypes" :key="type" :value="type">{{ type }}</option>
+      </select>
+      <select v-model="acquisition" class="sel" :disabled="methodsLoading || !!methodsError" aria-label="Acquisition type" @change="changeFilter">
+        <option value="">Any acquisition</option>
+        <option v-for="type in acquisitionTypes" :key="type" :value="type">{{ type }}</option>
       </select>
       <select v-model="collection" class="sel" @change="changeFilter">
         <option value="">Any collection</option>
@@ -175,6 +234,11 @@ const hasNext = computed(() => page.value < results.value.totalPages);
     </div>
 
     <div v-if="facetsError" class="error">Filters: {{ facetsError }}</div>
+    <div v-if="methodsError" class="error" role="alert">{{ methodsError }}</div>
+    <p v-if="methodsLoading" class="muted">Loading method filters in the background; dataset browsing remains available.</p>
+    <p v-if="metadataWarnings" class="muted">
+      Run metadata is unavailable for {{ metadataWarnings }} datasets; their method types are shown as Unknown.
+    </p>
     <div v-if="error" class="error">{{ error }}</div>
     <div v-if="busy && !results.datasets.length" class="muted">
       Searching… <span class="spinner"></span>
@@ -198,10 +262,11 @@ const hasNext = computed(() => page.value < results.value.totalPages);
           <h4>{{ ds.title || ds.accession }}</h4>
           <div class="sub muted" v-if="ds.organism || ds.instrument || ds.samples">
             <span v-if="ds.organism">{{ ds.organism }}</span>
-            <span v-if="ds.instrument"> · {{ ds.instrument }}</span>
+            <span v-if="ds.instrument"> · {{ ontologyName(ds.instrument) }}</span>
             <span v-if="ds.samples"> · {{ ds.samples }} samples</span>
           </div>
           <div class="counts">
+            <PortalMethods :dataset="ds" :loading="methodsLoading" />
             <span class="stat" title="Proteins"><b>{{ fmtCount(ds.proteins) }}</b> prot</span>
             <span class="stat" title="Distinct peptides"><b>{{ fmtCount(ds.peptides) }}</b> pep</span>
             <span class="stat" title="PSMs"><b>{{ fmtCount(ds.psmCount) }}</b> PSM</span>
@@ -219,11 +284,10 @@ const hasNext = computed(() => page.value < results.value.totalPages);
             <span v-if="(ds.tissues?.length ?? 0) > 5" class="tag more">+{{ ds.tissues!.length - 5 }} tissues</span>
           </div>
           <div class="links">
-            <a v-if="ds.pxUrl" :href="ds.pxUrl" target="_blank" rel="noopener">PRIDE ↗</a>
+            <a v-if="ds.pxUrl" :href="ds.pxUrl" target="_blank" rel="noopener">{{ ds.source && ds.source.trim().toLowerCase() !== 'unknown' ? ds.source.trim() : 'Source' }} ↗</a>
             <a v-if="ds.publication?.doi" :href="doiUrl(ds.publication.doi)" target="_blank" rel="noopener">
               DOI ↗
             </a>
-            <span v-if="ds.source" class="muted">{{ ds.source }}</span>
           </div>
         </div>
 
@@ -355,6 +419,7 @@ const hasNext = computed(() => page.value < results.value.totalPages);
 }
 .counts {
   display: flex;
+  flex-wrap: wrap;
   gap: 18px;
   margin-top: 4px;
   font-size: 13px;

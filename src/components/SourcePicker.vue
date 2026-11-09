@@ -9,9 +9,11 @@ import RecommendedDatasets from "./RecommendedDatasets.vue";
 
 const busy = ref(false);
 const error = ref("");
-const showS3 = ref(false);
-const showPortal = ref(false);
-const showDiscover = ref(false);
+const activePanel = ref<"s3" | "portal" | "discover" | null>(null);
+
+function togglePanel(panel: "s3" | "portal" | "discover") {
+  activePanel.value = activePanel.value === panel ? null : panel;
+}
 
 async function run(fn: () => Promise<void>) {
   busy.value = true;
@@ -65,15 +67,15 @@ async function openFolder() {
             <span class="s-title">Folder / collection</span>
             <span class="s-desc">A dataset folder, or a folder of many QPX projects.</span>
           </button>
-          <button class="source" :class="{ on: showS3 }" @click="showS3 = !showS3" :disabled="busy">
+          <button class="source" :class="{ on: activePanel === 's3' }" @click="togglePanel('s3')" :disabled="busy">
             <span class="s-title">S3 bucket</span>
             <span class="s-desc">Datasets in a bucket, read with your AWS credentials.</span>
           </button>
-          <button class="source" :class="{ on: showPortal }" @click="showPortal = !showPortal" :disabled="busy">
+          <button class="source" :class="{ on: activePanel === 'portal' }" @click="togglePanel('portal')" :disabled="busy">
             <span class="s-title">Quantms portal</span>
             <span class="s-desc">A reanalysed dataset from portal.quantms.org.</span>
           </button>
-          <button class="source" :class="{ on: showDiscover }" @click="showDiscover = !showDiscover" :disabled="busy">
+          <button class="source" :class="{ on: activePanel === 'discover' }" @click="togglePanel('discover')" :disabled="busy">
             <span class="s-title">Discover quantms data</span>
             <span class="s-desc">Search the portal by text, organism, instrument, peptide or protein.</span>
           </button>
@@ -85,11 +87,11 @@ async function openFolder() {
       <div class="error pad" v-if="error">{{ error }}</div>
       <div v-if="busy" class="muted">Working… <span class="spinner"></span></div>
 
-      <S3Picker v-if="showS3" />
-      <PortalPicker v-if="showPortal" />
-      <DiscoverView v-if="showDiscover" />
+      <S3Picker v-if="activePanel === 's3'" />
+      <PortalPicker v-else-if="activePanel === 'portal'" />
+      <DiscoverView v-else-if="activePanel === 'discover'" />
 
-      <RecommendedDatasets v-if="!showS3 && !showPortal && !showDiscover" />
+      <RecommendedDatasets v-else />
     </div>
   </div>
 </template>

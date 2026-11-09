@@ -2,6 +2,8 @@ pub mod io;
 pub mod peptide_search;
 pub mod portal;
 mod portal_http;
+pub mod portal_metadata;
+pub mod portal_ontology;
 pub mod progress;
 pub mod s3;
 pub mod sources;

@@ -85,8 +85,25 @@ Download the installer for your platform from the
 | **Single file** | Opens one `*.parquet` view plus its sibling views from the same folder. |
 | **Folder / collection** | Opens one QPX dataset folder, or a folder tree holding many projects. Subfolders that cannot be read are skipped and listed above the datasets in the sidebar. |
 | **S3 bucket** | Lists datasets under a bucket/prefix using your AWS credentials. You can stream the files lazily or download them to a local cache. S3-compatible stores (MinIO, Ceph) work too. |
-| **Quantms portal** | Searchable list of the datasets on [portal.quantms.org](https://portal.quantms.org) (title, organism, instrument, counts). You can stream a dataset lazily or download it to a local cache. No account needed. |
+| **Quantms portal** | Searchable list of the datasets on [portal.quantms.org](https://portal.quantms.org) (title, organism, instrument, quantification/acquisition types, counts). Filter by an instrument class or model, quantification family, and acquisition method. You can stream a dataset lazily or download it to a local cache. No account needed. |
 | **Discover quantms data** | Searches the portal's datasets by text, organism, instrument and collection, and finds the datasets that contain a peptide, protein or gene. In **Auto** mode, an upper-case string of 8 or more standard amino acids is searched as a peptide, as in the sidebar search box, and anything else as a protein or gene. Expand a result to stream or download its views. |
+
+The instrument picker is a searchable PSI-MS hierarchy: select an architecture class
+to include its descendant models, a vendor/series group, or an individual model.
+The app preserves the ontology's actual multiple-parent relationships rather than
+guessing from instrument names. It fetches PSI-MS 4.2.15 and caches the hierarchy for
+the app session. Unrecognized portal models remain individually selectable; if the
+hierarchy is unavailable, an error notice appears and the individual models remain.
+
+Quantification and acquisition metadata load in the background from the small QPX
+run view, without scanning feature or PSM data, and are cached by dataset version.
+Acquisition is the declared `acquisition_method`; quantification family (Label-free,
+TMT, iTRAQ or SILAC) is derived from declared sample labels, available in the tooltip.
+All runs contribute: mixed methods match each applicable filter. Missing/unrecognized
+values stay **Unknown**, never assumed label-free; unavailable versions show a notice.
+Browsing remains available while method filters load. Discover combines the filters
+before pagination so counts include the complete result set. Cards show one source-named
+repository link when a URL is available, rather than a duplicate plain source tag.
 
 Downloads show progress and can be cancelled at any point, even in the middle of a file; partial
 files are removed. Before a download starts, the app checks the free space on the cache disk: it

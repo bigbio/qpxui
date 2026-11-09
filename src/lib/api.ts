@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { InstrumentTerm } from "./ontology";
 
 export interface ExportFilter {
   name: string;
@@ -43,7 +44,14 @@ export interface S3Listing {
   datasets: DatasetInfo[];
 }
 
-export interface PortalDataset {
+export interface PortalMethodInfo {
+  quantificationTypes?: string[];
+  acquisitionTypes?: string[];
+  quantificationLabels?: string[];
+  metadataError?: string | null;
+}
+
+export interface PortalDataset extends PortalMethodInfo {
   accession: string;
   title?: string | null;
   organism?: string | null;
@@ -190,6 +198,9 @@ export const api = {
       collection?: string | null;
       organism?: string | null;
       instrument?: string | null;
+      instruments?: string[] | null;
+      quantification?: string | null;
+      acquisition?: string | null;
       sort?: string | null;
       page?: number;
       pageSize?: number;
@@ -197,6 +208,9 @@ export const api = {
   ) => invoke<PortalSearchResult>("portal_search", { query, ...opts }),
   /** Organism / instrument / collection facet options for the discover UI. */
   portalFacets: () => invoke<PortalFacets>("portal_facets"),
+  portalInstrumentTerms: () => invoke<InstrumentTerm[]>("portal_instrument_terms"),
+  portalMethodMetadata: (datasetRefs: string[]) =>
+    invoke<Record<string, PortalMethodInfo>>("portal_method_metadata", { datasetRefs }),
   /** Cross-dataset peptide / protein / gene search over the quantms portal. */
   psSearch: (
     query: string,
