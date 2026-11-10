@@ -12,3 +12,7 @@ src-tauri/target/
 
 # Sample data (downloaded with scripts/fetch-sample.mjs)
 sample/
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md
