@@ -44,10 +44,24 @@ export interface SettingsState {
   theme: Theme;
   /** entry.id -> colour override hex. */
   ptmColors: Record<string, string>;
+  /**
+   * Heavy or rarely used columns loaded by default in the Browse table
+   * (peak/spectrum arrays, cv_params, score lists). Keyed by lowercased column
+   * name; absent/undefined means "hidden by default". The table's per-view
+   * "Columns" menu still loads any of them on demand.
+   */
+  columns: Record<string, boolean>;
+  /**
+   * Per-view overrides of the above: view path -> { lowercased column ->
+   * shown }. A value here wins over the global `columns` default.
+   */
+  viewColumns: Record<string, Record<string, boolean>>;
+  /** Rows per page in the Browse table (clamped 20–2000). */
+  pageSize: number;
 }
 
 function defaults(): SettingsState {
-  return { theme: "light", ptmColors: {} };
+  return { theme: "light", ptmColors: {}, columns: {}, viewColumns: {}, pageSize: 500 };
 }
 
 function load(): SettingsState {
@@ -92,6 +106,45 @@ export function effectivePtmColor(id: string): string {
 /** Reset one palette entry back to its default colour. */
 export function resetPtmColor(id: string) {
   delete settings.ptmColors[id];
+  persist();
+}
+
+/** Whether an optional/heavy column is loaded in the Browse table by default.
+ * Present but unlisted columns are hidden by default; the per-view "Columns"
+ * menu can still load them on demand. */
+export function columnEnabledDefault(col: string): boolean {
+  return settings.columns[col.toLowerCase()] ?? false;
+}
+
+/** Set whether an optional/heavy column is loaded by default in Browse. */
+export function setColumnEnabledDefault(col: string, on: boolean) {
+  const k = col.toLowerCase();
+  if (on) settings.columns[k] = true;
+  else delete settings.columns[k];
+  persist();
+}
+
+/**
+ * The user's saved visibility for an optional column in one view, or undefined
+ * when they haven't overridden it there (fall back to the global default).
+ */
+export function viewColumnShown(viewPath: string, col: string): boolean | undefined {
+  return settings.viewColumns[viewPath]?.[col.toLowerCase()];
+}
+
+/** Remember an optional column's visibility for one view, across sessions. */
+export function setViewColumnShown(viewPath: string, col: string, shown: boolean) {
+  const k = col.toLowerCase();
+  const vc = (settings.viewColumns[viewPath] ??= {});
+  if (shown) vc[k] = true;
+  else delete vc[k];
+  persist();
+}
+
+/** Set the rows-per-page of the Browse table, clamped to a sane range. */
+export function setPageSize(n: number) {
+  const v = Math.round(Number(n));
+  settings.pageSize = Number.isFinite(v) ? Math.max(20, Math.min(2000, v)) : 500;
   persist();
 }
 
