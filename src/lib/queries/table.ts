@@ -10,6 +10,32 @@ export const PEAK_COLS = new Set<string>([COL.mz_array, COL.intensity_array, COL
 
 export const isPeakColumn = (c: string) => PEAK_COLS.has(c.toLowerCase());
 
+/**
+ * Heavy or rarely used columns the Browse table skips by default (the SELECT
+ * never reads them, so for streamed files their chunks aren't fetched). They
+ * are loaded on demand: per view from the table's "Columns" menu, or for a
+ * single PSM from the spectrum viewer. `additional_scores` and
+ * `additional_intensities` are name-value list columns not in `COL`.
+ */
+export interface OptionalColumn {
+  /** Exact column name as it appears in the parquet file. */
+  col: string;
+  /** Short human label for the settings panel. */
+  label: string;
+}
+export const OPTIONAL_COLUMNS: OptionalColumn[] = [
+  { col: COL.mz_array, label: "Peak array: m/z" },
+  { col: COL.intensity_array, label: "Peak array: intensity" },
+  { col: COL.charge_array, label: "Peak array: charge" },
+  { col: COL.ion_type_array, label: "Peak array: ion type" },
+  { col: COL.ion_mobility_array, label: "Peak array: ion mobility" },
+  { col: COL.cv_params, label: "cv_params (CV-controlled parameters)" },
+  { col: "additional_scores", label: "additional_scores" },
+  { col: "additional_intensities", label: "additional_intensities" },
+];
+const OPTIONAL_SET = new Set(OPTIONAL_COLUMNS.map((o) => o.col.toLowerCase()));
+export const isOptionalColumn = (c: string) => OPTIONAL_SET.has(c.toLowerCase());
+
 /** The SELECT list: the plain columns, then (with `peaks`) the peak arrays. */
 export function selectList(cols: string[], peaks: boolean): string {
   if (!cols.length) return "*";

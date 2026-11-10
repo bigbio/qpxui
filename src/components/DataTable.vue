@@ -5,7 +5,8 @@ import { isStructured, toJson } from "../lib/format";
 import type { ViewInfo } from "../lib/api";
 import type { TableRef } from "../lib/report";
 import { viewScale } from "../lib/report";
-import { cellFilter, isPeakColumn, tableCount, tablePage } from "../lib/queries/table";
+import { cellFilter, isOptionalColumn, isPeakColumn, tableCount, tablePage } from "../lib/queries/table";
+import { columnEnabledDefault, setViewColumnShown, settings, viewColumnShown } from "../lib/settings";
 import { state } from "../store";
 import ResultCell from "./table/ResultCell.vue";
 import CellMenu from "./table/CellMenu.vue";
@@ -21,7 +22,7 @@ const table = ref("");
 const result = shallowRef<QueryResult>({ columns: [], rows: [], rowCount: 0, truncated: false });
 const total = ref(0);
 const page = ref(0);
-const pageSize = 500;
+const pageSize = computed(() => settings.pageSize);
 const where = ref("");
 const sortCol = ref<string | null>(null);
 const sortDir = ref<"ASC" | "DESC">("ASC");
@@ -32,14 +33,22 @@ const expanded = ref<Record<string, boolean>>({});
 // cells fall back to the plain scalar/structured rendering.
 const ptmOn = ref(true);
 
-// Per-peak arrays of a psm view: shown as "N peaks", after the other columns.
-const showPeaks = ref(true);
-// Large streamed views start with peaks hidden: a page with peaks reads a
-// whole row group of peak arrays (often 100+ MB).
+// Heavy / rarely used columns (peak arrays, cv_params, score lists) are not
+// read by default: for streamed files that skips fetching their chunks. Each
+// is loadable per view from the "Columns" menu, and the spectrum viewer always
+// fetches a single PSM's peaks on demand. `optVis` maps lowercased column name
+// -> loaded for this view.
+const optVis = ref<Record<string, boolean>>({});
+// Large streamed views start with the peak arrays hidden too: a page with them
+// reads a whole row group of peaks (often 100+ MB).
 const largeRemote = ref(false);
 const colTypes = ref<Record<string, string>>({});
 const colNames = ref<string[]>([]);
 const hasPeakCols = computed(() => colNames.value.some(isPeakColumn));
+const hasExtra = computed(() => colNames.value.some((c) => isOptionalColumn(c) && !isPeakColumn(c)));
+const extraCols = computed(() => colNames.value.filter((c) => isOptionalColumn(c) && !isPeakColumn(c)));
+// The SQL SELECT list: every column except hidden optional ones.
+const selectCols = computed(() => colNames.value.filter((c) => !isOptionalColumn(c) || !!optVis.value[c.toLowerCase()]));
 
 let loadSeq = 0;
 async function load() {
@@ -53,13 +62,20 @@ async function load() {
       const desc = await describeTable(table.value);
       colNames.value = desc.map((d) => d.name);
       colTypes.value = Object.fromEntries(desc.map((d) => [d.name.toLowerCase(), d.type]));
+      const vis: Record<string, boolean> = {};
+      for (const c of colNames.value) {
+        if (!isOptionalColumn(c)) continue;
+        // Per-view saved choice wins over the global default.
+        const saved = viewColumnShown(props.view.path, c);
+        vis[c.toLowerCase()] = saved ?? columnEnabledDefault(c);
+      }
       if (hasPeakCols.value && /^(s3|https?):\/\//.test(props.view.path)) {
         largeRemote.value = (await viewScale({ view: props.view, table: table.value })).large;
         if (largeRemote.value) {
-          showPeaks.value = false;
-          return; // the showPeaks watcher reloads without the peak columns
+          for (const c of colNames.value) if (isPeakColumn(c)) vis[c.toLowerCase()] = false;
         }
       }
+      optVis.value = vis;
     }
     const n = await tableCount(table.value, where.value);
     if (id !== loadSeq) return;
@@ -67,12 +83,12 @@ async function load() {
 
     const res = await tablePage({
       table: table.value,
-      cols: colNames.value,
-      peaks: showPeaks.value,
+      cols: selectCols.value,
+      peaks: true,
       where: where.value,
       sort: sortCol.value ? { col: sortCol.value, dir: sortDir.value } : null,
       page: page.value,
-      pageSize,
+      pageSize: pageSize.value,
     });
     if (id === loadSeq) result.value = res;
   } catch (e: any) {
@@ -83,7 +99,30 @@ async function load() {
 }
 
 onMounted(load);
-watch(showPeaks, () => load());
+
+/** Load or skip an optional column for this view, then reload the page. */
+function toggleOptional(col: string) {
+  const k = col.toLowerCase();
+  optVis.value[k] = !optVis.value[k];
+  setViewColumnShown(props.view.path, col, optVis.value[k]);
+  load();
+}
+
+/** Quick toggle for all peak arrays at once (the spectra), as before. */
+const peakCols = computed(() => colNames.value.filter(isPeakColumn));
+const peaksVisible = computed(() => peakCols.value.length > 0 && peakCols.value.every((c) => !!optVis.value[c.toLowerCase()]));
+function togglePeaks() {
+  const on = !peaksVisible.value;
+  for (const c of peakCols.value) {
+    optVis.value[c.toLowerCase()] = on;
+    setViewColumnShown(props.view.path, c, on);
+  }
+  load();
+}
+
+/** Hidden optional columns of this view, in column order: shown as a
+ * placeholder column with a "load" affordance instead of silently vanishing. */
+const hiddenOptionals = computed(() => colNames.value.filter((c) => isOptionalColumn(c) && !optVis.value[c.toLowerCase()]));
 
 function isPeakCol(j: number): boolean {
   return isPeakColumn(result.value.columns[j] ?? "");
@@ -104,7 +143,10 @@ const psmRef = computed<TableRef | null>(() => {
 /** Why the selected row cannot open the spectrum viewer, or "" when it can. */
 const spectrumBlock = computed<string>(() => {
   if (!menu.value || !psmRef.value) return "Spectra need a psm view with peptidoform and peak arrays";
-  return whyNoSpectrum(result.value.columns, result.value.rows[menu.value.i], showPeaks.value);
+  // Peaks read on this page decide the check; when they're hidden the viewer
+  // fetches the single PSM's peaks on demand, so opening is still allowed.
+  const peaksRead = result.value.columns.some(isPeakColumn);
+  return whyNoSpectrum(result.value.columns, result.value.rows[menu.value.i], peaksRead);
 });
 
 function openMenu(ev: MouseEvent, i: number, j: number) {
@@ -207,8 +249,13 @@ watch(() => [props.view.path, where.value], () => {
   page.value = 0;
   load();
 });
+// Re-query when the browse page size changes (from Settings > Advanced).
+watch(pageSize, () => {
+  page.value = 0;
+  load();
+});
 
-const totalPages = computed(() => Math.max(0, Math.ceil(total.value / pageSize)));
+const totalPages = computed(() => Math.max(0, Math.ceil(total.value / pageSize.value)));
 const shown = computed(() => result.value.rows.length);
 
 function prev() {
@@ -267,12 +314,26 @@ function isModsCell(j: number): boolean {
         v-if="hasPeakCols"
         class="ptm-toggle"
         :title="largeRemote
-          ? 'Large streamed view: peak arrays are hidden because a page with them reads a whole row group of peaks (often 100+ MB). Right-click a PSM to open its spectrum.'
-          : 'Peak arrays (mz_array, intensity_array, …) are shown last as \'N peaks\'. Untick to hide them and skip reading them.'"
+          ? 'Large streamed view: peak arrays are hidden because a page with them reads a whole row group of peaks (often 100+ MB). Tick to load them, or right-click a PSM to open its spectrum.'
+          : 'Peak arrays (mz_array, intensity_array, …) are heavy and hidden by default. Tick to load them (shown last as \'N peaks\') for this view.'"
       >
-        <input type="checkbox" v-model="showPeaks" />
+        <input type="checkbox" :checked="peaksVisible" @change="togglePeaks" />
         <span>Peak arrays</span>
       </label>
+      <details v-if="hasExtra" class="cols-menu">
+        <summary :title="largeRemote
+          ? 'Extra columns are hidden on large streamed views to avoid reading whole row groups. Load them here for this view.'
+          : 'Load rarely used columns for this view. They are skipped by default so the table stays lean.'">
+          Columns…
+        </summary>
+        <div class="cols-pop">
+          <label v-for="c in extraCols" :key="c" class="col-row">
+            <input type="checkbox" :checked="!!optVis[c.toLowerCase()]" @change="toggleOptional(c)" />
+            <span class="mono">{{ c }}</span>
+          </label>
+          <p class="hint-sm">Defaults come from Settings → “Columns loaded in Browse”. Hidden columns use no bandwidth until loaded.</p>
+        </div>
+      </details>
       <select
         v-if="result.columns.length > 6"
         v-model="jumpCol"
@@ -305,6 +366,15 @@ function isModsCell(j: number): boolean {
               {{ c }}
               <span class="sort" v-if="sortCol === c">{{ sortDir === "ASC" ? "▲" : "▼" }}</span>
             </th>
+            <th
+              v-for="c in hiddenOptionals"
+              :key="'h:' + c"
+              class="mono opt-hidden"
+              :title="`${c} is hidden (not downloaded). Click to load it for this view.`"
+              @click="toggleOptional(c)"
+            >
+              {{ c }} · hidden
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -325,6 +395,15 @@ function isModsCell(j: number): boolean {
                 toggle-titles
                 @toggle="toggle(i, j)"
               />
+            </td>
+            <td
+              v-for="c in hiddenOptionals"
+              :key="'h:' + c"
+              class="opt-hidden"
+              :title="`Load ${c} for this view`"
+              @click="toggleOptional(c)"
+            >
+              <span class="load-col">Load {{ c }}</span>
             </td>
           </tr>
         </tbody>
@@ -412,6 +491,57 @@ function isModsCell(j: number): boolean {
   font-size: 12px;
   max-width: 190px;
 }
+/* "Columns…" menu for loading rarely used columns per view. */
+.cols-menu {
+  position: relative;
+  font-size: 12px;
+}
+.cols-menu summary {
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-dim);
+  list-style: none;
+  white-space: nowrap;
+}
+.cols-menu summary::-webkit-details-marker {
+  display: none;
+}
+.cols-menu summary:hover {
+  color: var(--accent);
+}
+.cols-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 240px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  padding: 6px 8px;
+}
+.col-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px;
+  font-size: 12.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.col-row input {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.hint-sm {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin: 6px 2px 2px;
+  line-height: 1.4;
+}
 th.flash-col {
   background: var(--brand-tint);
   transition: background 0.3s;
@@ -448,6 +578,33 @@ th {
 }
 th:hover {
   color: var(--accent);
+}
+/* Hidden optional columns: a distinguishable placeholder you can click to load. */
+th.opt-hidden,
+td.opt-hidden {
+  color: var(--muted);
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--bg-alt),
+    var(--bg-alt) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+  cursor: pointer;
+}
+th.opt-hidden:hover,
+td.opt-hidden:hover {
+  color: var(--accent);
+  background-color: var(--brand-tint);
+}
+.load-col {
+  font-size: 11.5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+}
+td.opt-hidden:hover .load-col {
+  border-color: var(--accent);
 }
 .sort {
   font-size: 10px;

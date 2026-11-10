@@ -214,6 +214,12 @@ Click a view in the sidebar to work with its rows directly:
 - **Browse**: a table showing 500 rows per page, with column sorting and a live SQL `WHERE` filter;
   the row count follows the filter.
   Nested cells (lists and structs) can be expanded.
+  Heavy or rarely used columns — peak/spectrum arrays (`mz_array`, …), `cv_params` and the
+  `additional_scores`/`additional_intensities` lists — are **not read by default**, so for streamed
+  files their data is never downloaded. Load them for the current view from the toolbar's **Peak
+  arrays** tick box and **Columns…** menu (or click a striped *(hidden)* placeholder column), and
+  those per-view choices are remembered; the default for every dataset is set in
+  **Settings → Columns loaded in Browse**.
 - **Summary**: automatic charts per column, and a histogram of any numeric column. It has up to 30
   bins (whole-number bins for integer columns) labelled with their start value, and leaves out
   infinite and NaN values. Hover a bar for its range and count.
@@ -228,7 +234,12 @@ Click a view in the sidebar to work with its rows directly:
   known keyword in its name, so *Dimethyl* is not coloured as *Methyl*. The default colours follow
   the portal: biological modifications (phosphorylation, oxidation, acetylation, …) take distinct
   colours, and fixed or chemical ones such as carbamidomethylation are grey.
-- **Settings**: light or dark theme, and a colour for each PTM, which every table and chart uses.
+- **Settings** (a tabbed dialog): **Appearance** — light/dark theme and a colour for each PTM
+  (used by every table and chart); **Data & download** — which heavy/rarely used columns (peak
+  arrays, `cv_params`, score/intensity lists) are read by default; **Advanced** — rows per page in
+  the Browse table. Hidden columns show as striped *(hidden)* placeholders
+  and use no bandwidth until you load them (per view from the table's **Columns…** menu, or for a
+  single PSM from the spectrum viewer); per-view choices are remembered.
 - **Export**: every chart can be saved as PNG or CSV, and every table as CSV, through the system
   save dialog.
 
@@ -300,7 +311,8 @@ however big it is. Anything that would read whole columns waits for you to ask:
 - **Overview, QC, PTMs, Quantification**: a **Compute** button shows a lower-bound estimate of the
   data it will fetch.
 - **Proteins and Peptidoforms**: wait for a search term; peptide search defaults to an exact sequence match.
-- **Browse**: peak arrays start hidden; **Summary** builds its charts on request.
+- **Browse**: peak arrays and other heavy columns (`cv_params`, score/intensity lists) start hidden
+  unless you've enabled them in Settings; **Summary** builds its charts on request.
 
 How fast searches and spectra are depends on how the file was written: files sorted by peptidoform
 with small row groups (`qpxc transform relayout`) let each lookup read a few MB.
