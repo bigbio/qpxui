@@ -1,6 +1,6 @@
 // The Peptidoforms tab: peptidoform search over the evidence view and one
 // peptidoform's per-run evidence (features, or PSMs when they carry spectra).
-import { runSql } from "../duck";
+import { rowsView, runSql } from "../duck";
 import { ident, intensitySumExpr, likePattern, lit, objects, targetWhere, type TableRef } from "../report";
 import { COL } from "../qpx";
 
@@ -86,9 +86,11 @@ export async function peptidoformEvidence(E: TableRef, peptidoform: string): Pro
     has(COL.mass_error_ppm) ? COL.mass_error_ppm : null,
     has(COL.posterior_error_probability) ? COL.posterior_error_probability : null,
     isum ? `CASE WHEN ${isum} > 0 THEN log10(${isum}) END AS log_int` : null,
+    // Where the row is in the file, so the spectrum viewer reads it directly.
+    "file_row_number",
   ].filter(Boolean);
   const r = await runSql(
-    `SELECT ${sel.join(", ")} FROM ${ident(E.table)} WHERE ${targetWhere(E)} AND ${pfCol} = ${lit(peptidoform)}
+    `SELECT ${sel.join(", ")} FROM ${ident(rowsView(E.table))} WHERE ${targetWhere(E)} AND ${pfCol} = ${lit(peptidoform)}
        ORDER BY ${has(COL.run_file_name) ? COL.run_file_name : "1"}${has(COL.posterior_error_probability) ? `, ${COL.posterior_error_probability}` : ""} LIMIT 5000`
   );
   return objects(r);

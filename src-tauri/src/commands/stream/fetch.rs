@@ -127,7 +127,28 @@ pub(super) async fn http_range(
 }
 
 /// Fetch one inclusive byte range from the object's source.
+/// Tries per range: a response whose body stalls or breaks part-way (the
+/// read timeout, a reset connection) fails only that try.
+const FETCH_ATTEMPTS: usize = 3;
+
 async fn fetch(obj: &Object, start: u64, end: u64) -> Result<Bytes, String> {
+    let mut attempt = 1;
+    loop {
+        match fetch_once(obj, start, end).await {
+            Err(e) if attempt < FETCH_ATTEMPTS && !matches!(obj.source, Source::Local { .. }) => {
+                log::warn!(
+                    "fetch {} bytes {start}-{end}: {e}; retrying ({attempt}/{FETCH_ATTEMPTS})",
+                    obj.path
+                );
+                tokio::time::sleep(backoff_delay(attempt - 1)).await;
+                attempt += 1;
+            }
+            r => return r,
+        }
+    }
+}
+
+async fn fetch_once(obj: &Object, start: u64, end: u64) -> Result<Bytes, String> {
     let t0 = std::time::Instant::now();
     let r = fetch_source(obj, start, end).await;
     let ms = t0.elapsed().as_millis();
@@ -234,13 +255,7 @@ pub(super) async fn read_range(
     let data = read_blocks(p, id, obj, start, end, true)
         .await?
         .ok_or_else(|| format!("short read for {}", obj.path))?;
-    tokio::spawn(super::readahead::read_ahead(
-        p.clone(),
-        id.to_string(),
-        obj.clone(),
-        start,
-        end,
-    ));
+    super::readahead::read_ahead(p, id, obj, start, end);
     Ok(data)
 }
 
