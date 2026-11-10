@@ -103,6 +103,7 @@ pub async fn register(
                     },
                     fetched: AtomicU64::new(0),
                     requests: AtomicU64::new(0),
+                    layout: Default::default(),
                 });
                 p.objects.lock().unwrap().insert(id.clone(), o.clone());
                 o
@@ -160,6 +161,7 @@ pub async fn register_http(urls: &[String]) -> Result<BTreeMap<String, StreamHan
                     },
                     fetched: AtomicU64::new(0),
                     requests: AtomicU64::new(0),
+                    layout: Default::default(),
                 });
                 p.objects.lock().unwrap().insert(id.clone(), o.clone());
                 o
@@ -205,6 +207,7 @@ pub async fn register_local(paths: &[String]) -> Result<BTreeMap<String, StreamH
                 source: Source::Local { path: pb.clone() },
                 fetched: AtomicU64::new(0),
                 requests: AtomicU64::new(0),
+                layout: Default::default(),
             });
             p.objects.lock().unwrap().insert(id.clone(), o);
         }
@@ -280,5 +283,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("only .parquet"));
+    }
+
+    /// Live benchmark: native DuckDB on one thread (like duckdb-wasm) reading
+    /// a 41.8 GB portal PSM file through the proxy. Needs the `duckdb` CLI.
+    /// `cargo test live_stream_scan -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_stream_scan() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let url = "https://browse.quantms.org/quantms/datasets/HuiYan-E480/392295b50151/HuiYan-E480-P1.psm.parquet".to_string();
+        let handles = register_http(std::slice::from_ref(&url)).await.unwrap();
+        let proxied = handles[&url].url.clone();
+        let sql = format!(
+            "SET threads=1; SET enable_http_metadata_cache=false; \
+             SELECT charge, count(*) FROM read_parquet('{proxied}') WHERE NOT is_decoy GROUP BY 1 ORDER BY 1;"
+        );
+        let t = std::time::Instant::now();
+        let out = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("duckdb")
+                .arg("-c")
+                .arg(&sql)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        println!("{}", String::from_utf8_lossy(&out.stdout));
+        eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+        let stats = stats();
+        let s = &stats[&url];
+        println!(
+            "charge scan: {secs:.1}s, {} requests, {:.1} MB fetched",
+            s.requests,
+            s.fetched_bytes as f64 / 1e6
+        );
+        assert!(out.status.success());
     }
 }

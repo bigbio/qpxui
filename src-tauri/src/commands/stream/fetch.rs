@@ -1,20 +1,24 @@
 //! Reading byte ranges from an object's source (S3, the portal over HTTPS,
 //! or a local file), through the shared block cache for remote objects.
 
-use super::{Object, Proxy, Source};
+use super::{Object, Pending, Proxy, Source};
 use bytes::Bytes;
 use hyper::header;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Cache granularity. Requests are widened to whole blocks so neighbouring
-/// small reads (parquet footers, page headers) share one S3 round-trip.
-const BLOCK: u64 = 256 * 1024;
-/// Longest single range request (in blocks): 16 x 256 KB = 4 MB.
-const CHUNK_BLOCKS: u64 = 16;
+/// small reads (parquet footers, page headers) share one round trip. Kept
+/// small: a narrow column of a file with many row groups is read as many
+/// chunks of a few KB each, and every one of them costs a whole block.
+pub(super) const BLOCK: u64 = 64 * 1024;
+/// Longest single range request (in blocks): 64 x 64 KB = 4 MB.
+const CHUNK_BLOCKS: u64 = 64;
 /// Range requests issued concurrently for one large read.
 const PARALLEL_FETCHES: usize = 8;
+/// Range requests issued concurrently by one read-ahead.
+pub(super) const PREFETCH_FETCHES: usize = 8;
 
 /// Follow the portal's redirect once to get the signed storage URL.
 async fn resolve(client: &reqwest::Client, url: &str) -> Result<String, String> {
@@ -189,12 +193,12 @@ fn read_local(path: &std::path::Path, start: u64, end: u64) -> Result<Bytes, Str
     Ok(Bytes::from(buf))
 }
 
-/// Serve [start, end] from the block cache, fetching missing blocks from S3 in
-/// as few contiguous range requests as possible.
+/// Serve [start, end] to DuckDB from the block cache, fetching what is
+/// missing, then read ahead the next chunks of the columns it read.
 pub(super) async fn read_range(
-    p: &Proxy,
+    p: &Arc<Proxy>,
     id: &str,
-    obj: &Object,
+    obj: &Arc<Object>,
     start: u64,
     end: u64,
 ) -> Result<Bytes, String> {
@@ -203,50 +207,90 @@ pub(super) async fn read_range(
     if matches!(obj.source, Source::Local { .. }) {
         return fetch(obj, start, end).await;
     }
+    let data = read_blocks(p, id, obj, start, end, true)
+        .await?
+        .ok_or_else(|| format!("short read for {}", obj.path))?;
+    tokio::spawn(super::readahead::read_ahead(
+        p.clone(),
+        id.to_string(),
+        obj.clone(),
+        start,
+        end,
+    ));
+    Ok(data)
+}
+
+/// Make the blocks covering [start, end] available and, when `assemble`,
+/// return those bytes. Cached blocks are reused, blocks another request is
+/// already fetching are waited for, and the rest is fetched in as few
+/// contiguous range requests as possible, several at once.
+pub(super) async fn read_blocks(
+    p: &Arc<Proxy>,
+    id: &str,
+    obj: &Arc<Object>,
+    start: u64,
+    end: u64,
+    assemble: bool,
+) -> Result<Option<Bytes>, String> {
     let (first, last) = (start / BLOCK, end / BLOCK);
     let mut blocks: BTreeMap<u64, Bytes> = BTreeMap::new();
+    let mut waits: Vec<(u64, Pending)> = Vec::new();
     {
+        // Lock order: cache, then in-flight (as in `pending_run`).
         let mut cache = p.cache.lock().unwrap();
+        let mut inflight = p.inflight.lock().unwrap();
+        let mut missing: Vec<u64> = Vec::new();
         for b in first..=last {
-            if let Some(d) = cache.get(&(id.to_string(), b)) {
-                blocks.insert(b, d.clone());
+            let key = (id.to_string(), b);
+            if let Some(d) = cache.get(&key) {
+                if assemble {
+                    blocks.insert(b, d.clone());
+                }
+            } else if let Some((rb, fut)) = inflight.get(&key) {
+                if !waits.iter().any(|(r, _)| r == rb) {
+                    waits.push((*rb, fut.clone()));
+                }
+            } else {
+                missing.push(b);
             }
         }
+        // Group missing blocks into contiguous runs, and claim them before
+        // releasing the lock so no other request fetches them too.
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for b in missing {
+            match runs.last_mut() {
+                Some((s, e)) if *e + 1 == b && *e + 1 - *s < CHUNK_BLOCKS => *e = b,
+                _ => runs.push((b, b)),
+            }
+        }
+        for (rb, re) in runs {
+            let fut = pending_run(p.clone(), id.to_string(), obj.clone(), rb, re);
+            for b in rb..=re {
+                inflight.insert((id.to_string(), b), (rb, fut.clone()));
+            }
+            waits.push((rb, fut));
+        }
     }
-
-    // Group missing blocks into contiguous runs.
-    let mut runs: Vec<(u64, u64)> = Vec::new();
-    for b in first..=last {
-        if blocks.contains_key(&b) {
-            continue;
-        }
-        match runs.last_mut() {
-            Some((s, e)) if *e + 1 == b && *e + 1 - *s < CHUNK_BLOCKS => *e = b,
-            _ => runs.push((b, b)),
-        }
+    if waits.is_empty() && !assemble {
+        return Ok(None);
     }
     // Large reads (e.g. `SELECT *` touching many column chunks) become several
     // chunk-sized requests in flight at once instead of one long serial GET.
     use futures::stream::{self, StreamExt, TryStreamExt};
-    let fetched: Vec<(u64, u64, Bytes)> = stream::iter(runs)
-        .map(|(rb, re)| async move {
-            let s = rb * BLOCK;
-            let e = ((re + 1) * BLOCK).min(obj.size) - 1;
-            fetch(obj, s, e).await.map(|d| (rb, re, d))
-        })
+    let runs: Vec<_> = waits.into_iter().map(|(rb, f)| run_of(rb, f)).collect();
+    let fetched: Vec<(u64, Bytes)> = stream::iter(runs)
         .buffered(PARALLEL_FETCHES)
         .try_collect()
         .await?;
-    for (rb, re, data) in fetched {
-        let mut cache = p.cache.lock().unwrap();
-        for b in rb..=re {
-            let off = ((b - rb) * BLOCK) as usize;
-            if off >= data.len() {
-                break;
+    if !assemble {
+        return Ok(None);
+    }
+    for (rb, data) in fetched {
+        for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
+            let b = rb + i as u64;
+            if (first..=last).contains(&b) {
+                blocks.insert(b, data.slice_ref(chunk));
             }
-            let chunk = data.slice(off..(off + BLOCK as usize).min(data.len()));
-            cache.put((id.to_string(), b), chunk.clone());
-            blocks.insert(b, chunk);
         }
     }
 
@@ -262,7 +306,39 @@ pub(super) async fn read_range(
             out.extend_from_slice(&d[lo..hi]);
         }
     }
-    Ok(Bytes::from(out))
+    Ok(Some(Bytes::from(out)))
+}
+
+/// Await a pending run, keeping its first block.
+async fn run_of(rb: u64, fut: Pending) -> Result<(u64, Bytes), String> {
+    fut.await.map(|d| (rb, d))
+}
+
+/// A fetch of blocks `rb..=re` that every request needing them can await.
+/// When done it stores the blocks in the cache and releases its claim.
+fn pending_run(p: Arc<Proxy>, id: String, obj: Arc<Object>, rb: u64, re: u64) -> Pending {
+    use futures::FutureExt;
+    async move {
+        let s = rb * BLOCK;
+        let e = ((re + 1) * BLOCK).min(obj.size) - 1;
+        let r = fetch(&obj, s, e).await;
+        let mut cache = p.cache.lock().unwrap();
+        let mut inflight = p.inflight.lock().unwrap();
+        if let Ok(data) = &r {
+            for (i, chunk) in data.chunks(BLOCK as usize).enumerate() {
+                cache.put((id.clone(), rb + i as u64), data.slice_ref(chunk));
+            }
+        }
+        for b in rb..=re {
+            let key = (id.clone(), b);
+            if inflight.get(&key).is_some_and(|(r, _)| *r == rb) {
+                inflight.remove(&key);
+            }
+        }
+        r
+    }
+    .boxed()
+    .shared()
 }
 
 #[cfg(test)]
