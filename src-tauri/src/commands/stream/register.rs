@@ -105,6 +105,7 @@ pub async fn register(
                     requests: AtomicU64::new(0),
                     layout: Default::default(),
                 });
+                log::info!("streaming {} ({} MB)", o.path, o.size >> 20);
                 p.objects.lock().unwrap().insert(id.clone(), o.clone());
                 o
             }
@@ -163,6 +164,7 @@ pub async fn register_http(urls: &[String]) -> Result<BTreeMap<String, StreamHan
                     requests: AtomicU64::new(0),
                     layout: Default::default(),
                 });
+                log::info!("streaming {} ({} MB)", o.path, o.size >> 20);
                 p.objects.lock().unwrap().insert(id.clone(), o.clone());
                 o
             }

@@ -136,10 +136,20 @@ async fn layout(p: &Arc<Proxy>, id: &str, obj: &Arc<Object>) -> Option<Arc<Layou
             let meta = read_blocks(p, id, obj, size - 8 - len, size - 9, true)
                 .await
                 .ok()??;
-            tokio::task::spawn_blocking(move || Layout::from_footer(&meta))
+            let layout = tokio::task::spawn_blocking(move || Layout::from_footer(&meta))
                 .await
                 .ok()?
-                .map(Arc::new)
+                .map(Arc::new);
+            match &layout {
+                Some(l) => log::debug!(
+                    "read-ahead layout of {}: {} row groups, {} column chunks",
+                    obj.path,
+                    l.grid.len(),
+                    l.by_start.len()
+                ),
+                None => log::info!("no read-ahead for {}: footer not readable", obj.path),
+            }
+            layout
         })
         .await
         .clone()
