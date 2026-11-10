@@ -132,14 +132,28 @@ pub(super) async fn registry(
     }
     // One accession can hold several runs (e.g. PXD014877 has one per
     // organism), so the run ref, not the accession, identifies an entry.
+    Ok(dedup_runs(all))
+}
+
+/// One entry per run. A run listed in several collections can appear more
+/// than once, with the counts filled in only in some entries: keep the one
+/// that knows the most.
+fn dedup_runs(mut all: Vec<PortalDataset>) -> Vec<PortalDataset> {
     let key = |d: &PortalDataset| d.dataset_ref.clone().unwrap_or_else(|| d.accession.clone());
+    let known = |d: &PortalDataset| {
+        [d.samples, d.proteins, d.peptides, d.psm_count]
+            .iter()
+            .map(|v| v.unwrap_or(0))
+            .fold(0u64, u64::saturating_add)
+    };
     all.sort_by(|a, b| {
         a.accession
             .cmp(&b.accession)
             .then_with(|| key(a).cmp(&key(b)))
+            .then_with(|| known(b).cmp(&known(a)))
     });
-    all.dedup_by(|a, b| key(a) == key(b));
-    Ok(all)
+    all.dedup_by(|later, first| key(later) == key(first));
+    all
 }
 
 /// One page of search results from the quantms portal dataset catalogue.
@@ -286,6 +300,27 @@ pub async fn portal_facets() -> Result<PortalFacets, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn duplicate_runs_keep_the_entry_with_counts() {
+        let ds = |acc: &str, run: &str, psms: Option<u64>| {
+            let mut d: PortalDataset =
+                serde_json::from_value(serde_json::json!({ "accession": acc })).unwrap();
+            d.dataset_ref = Some(format!("{acc}/{run}"));
+            d.psm_count = psms;
+            d
+        };
+        let out = dedup_runs(vec![
+            ds("PXD2", "a", None),
+            ds("PXD1", "r", None),
+            ds("PXD2", "a", Some(4_290_071)),
+            ds("PXD2", "b", None),
+        ]);
+        let refs: Vec<_> = out.iter().map(|d| d.dataset_ref.clone().unwrap()).collect();
+        assert_eq!(refs, ["PXD1/r", "PXD2/a", "PXD2/b"]);
+        assert_eq!(out[1].psm_count, Some(4_290_071));
+    }
+
     use super::*;
 
     async fn json_case(
