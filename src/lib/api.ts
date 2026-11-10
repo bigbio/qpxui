@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { settings } from "./settings";
 
 export interface ExportFilter {
   name: string;
@@ -156,7 +157,7 @@ export const api = {
     invoke<S3Listing>("list_s3", { bucket, prefix }),
 
   cacheS3Views: (bucket: string, paths: string[], cancelId: string) =>
-    invoke<ViewInfo[]>("cache_s3_views", { bucket, paths, cancelId }),
+    invoke<ViewInfo[]>("cache_s3_views", { bucket, paths, cancelId, connections: settings.downloadConnections }),
 
   /** Register S3 views with the backend range proxy (lazy, no download). */
   streamS3Urls: (bucket: string, paths: string[]) =>
@@ -212,5 +213,5 @@ export const api = {
   portalListViews: (dataset: string, organism?: string | null, psmCount?: number | null) =>
     invoke<ViewInfo[]>("portal_list_views", { dataset, organism, psmCount }),
   portalCacheViews: (urls: string[], cancelId: string) =>
-    invoke<ViewInfo[]>("portal_cache_views", { urls, cancelId }),
+    invoke<ViewInfo[]>("portal_cache_views", { urls, cancelId, connections: settings.downloadConnections }),
 };

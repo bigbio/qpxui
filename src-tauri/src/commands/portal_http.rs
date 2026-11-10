@@ -33,10 +33,19 @@ fn shared(
     Ok(cell.get_or_init(|| client).clone())
 }
 
+/// Time allowed to open a connection, and to wait for each read once it is
+/// open. Without them a stalled server hangs a download (or a streamed query)
+/// forever; with them the request fails and a ranged download resumes.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(super) fn client_builder() -> Result<ClientBuilder, String> {
     let file = std::env::var_os("SSL_CERT_FILE");
     let dirs = std::env::var_os("SSL_CERT_DIR");
-    let builder = client_builder_with_sources(file.as_deref(), dirs.as_deref());
+    let builder = client_builder_with_sources(file.as_deref(), dirs.as_deref()).map(|b| {
+        b.connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+    });
     builder.map_err(|error| {
         format!(
             "{error} (if this is unexpected, unset SSL_CERT_FILE / SSL_CERT_DIR to use your system's trust store)"

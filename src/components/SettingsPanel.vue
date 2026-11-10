@@ -1,13 +1,16 @@
 <script setup lang="ts">
 // Settings modal, in tabs: Appearance (theme + PTM colours), Data & download
-// (heavy columns loaded by default), Advanced (browse page size, …).
+// (heavy columns loaded by default, parallel download connections), Advanced
+// (browse page size, …).
 import { ref } from "vue";
 import {
   PTM_PALETTE,
   columnEnabledDefault,
   effectivePtmColor,
   resetPtmColor,
+  DOWNLOAD_CONNECTIONS,
   setColumnEnabledDefault,
+  setDownloadConnections,
   setPageSize,
   setPtmColor,
   setTheme,
@@ -27,6 +30,13 @@ function pick(id: string, e: Event) {
 
 function pageSizeInput(e: Event) {
   setPageSize(Number((e.target as HTMLInputElement).value));
+}
+
+function connectionsInput(e: Event) {
+  const input = e.target as HTMLInputElement;
+  setDownloadConnections(Number(input.value));
+  // Show the clamped value even when the stored one did not change.
+  input.value = String(settings.downloadConnections);
 }
 </script>
 
@@ -111,6 +121,26 @@ function pageSizeInput(e: Event) {
                   <span class="mono col-name">{{ o.col }}</span>
                   <span class="col-label">{{ o.label }}</span>
                 </label>
+              </div>
+            </section>
+            <section>
+              <h4>Parallel download connections</h4>
+              <p class="hint">
+                <em>Download to cache</em> fetches each large file as several byte ranges at once. Remote
+                storage limits the speed of each connection to a few MB/s, so more connections are usually
+                faster, up to your own bandwidth. Lower it on a slow or shared network.
+              </p>
+              <div class="num-row">
+                <input
+                  type="number"
+                  :min="DOWNLOAD_CONNECTIONS.min"
+                  :max="DOWNLOAD_CONNECTIONS.max"
+                  step="1"
+                  class="num"
+                  :value="settings.downloadConnections"
+                  @change="connectionsInput"
+                />
+                <span class="hint-sm">connections ({{ DOWNLOAD_CONNECTIONS.min }}–{{ DOWNLOAD_CONNECTIONS.max }}, default {{ DOWNLOAD_CONNECTIONS.default }})</span>
               </div>
             </section>
           </template>

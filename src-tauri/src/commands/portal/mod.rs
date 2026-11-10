@@ -65,6 +65,7 @@ mod tests {
             tmp.path(),
             "test-cancel".to_string(),
             vec![url],
+            8,
         )
         .await
         .expect("cache");
