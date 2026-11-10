@@ -95,6 +95,24 @@ pub fn init(dir: Option<PathBuf>, detailed: bool) {
     );
 }
 
+/// Continue the log in `dir` (after the user moved it in Settings).
+pub fn reopen(dir: Option<PathBuf>) -> Result<(), String> {
+    let Some(dir) = dir else {
+        return Err("no log folder available".into());
+    };
+    let (file, path) = open(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    LOGGER.flush();
+    *LOGGER.file.lock().unwrap() = Some(file);
+    *LOGGER.path.lock().unwrap() = Some(path.clone());
+    log::info!(
+        target: "qpxui",
+        "QPX UI {} log continues in {}",
+        env!("CARGO_PKG_VERSION"),
+        path.display()
+    );
+    Ok(())
+}
+
 /// Open `dir/qpxui.log` for appending, moving a large one aside first.
 fn open(dir: &Path) -> std::io::Result<(File, PathBuf)> {
     std::fs::create_dir_all(dir)?;

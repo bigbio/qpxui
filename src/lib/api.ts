@@ -24,6 +24,14 @@ export interface DatasetInfo {
   catalog?: CatalogStats;
 }
 
+/** Where the app keeps downloads and its log (null: not available). */
+export interface StoragePaths {
+  cacheDir: string | null;
+  cacheDirDefault: string | null;
+  logDir: string | null;
+  logDirDefault: string | null;
+}
+
 /** Whole-dataset counts the portal catalogue already knows. */
 export interface CatalogStats {
   proteins?: number | null;
@@ -156,9 +164,16 @@ export const api = {
       filters: [{ name: "QPX", extensions: ["parquet"] }],
     }) as Promise<string | null>,
 
-  /** Native folder picker. */
-  chooseFolder: (): Promise<string | null> =>
-    open({ directory: true, multiple: false }) as Promise<string | null>,
+  /** Native folder picker, opened at `defaultPath` when given. */
+  chooseFolder: (defaultPath?: string): Promise<string | null> =>
+    open({ directory: true, multiple: false, defaultPath }) as Promise<string | null>,
+
+  /** The download cache and log folders, and their defaults. */
+  storagePaths: () => invoke<StoragePaths>("storage_paths"),
+  /** Move the download cache (null: back to the default). */
+  setCacheDir: (path: string | null) => invoke<StoragePaths>("set_cache_dir", { path }),
+  /** Move the log (null: back to the default). */
+  setLogDir: (path: string | null) => invoke<StoragePaths>("set_log_dir", { path }),
 
   openFile: (path: string) => invoke<DatasetInfo>("open_file", { path }),
 

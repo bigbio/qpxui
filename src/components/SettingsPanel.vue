@@ -2,7 +2,10 @@
 // Settings modal, in tabs: Appearance (theme + PTM colours), Data & download
 // (heavy columns loaded by default, parallel download connections), Advanced
 // (browse page size, …), Diagnostics (the app log).
-import { ref } from "vue";
+import { ref, watch } from "vue";
+import { api, type StoragePaths } from "../lib/api";
+import { fmtBytes } from "../lib/format";
+import FolderSetting from "./FolderSetting.vue";
 import {
   PTM_PALETTE,
   columnEnabledDefault,
@@ -19,7 +22,7 @@ import {
 import { OPTIONAL_COLUMNS } from "../lib/queries/table";
 import DiagnosticsPanel from "./DiagnosticsPanel.vue";
 
-defineProps<{ open: boolean }>();
+const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
 
 const tab = ref<"appearance" | "data" | "advanced" | "diagnostics">("appearance");
@@ -32,6 +35,25 @@ function pick(id: string, e: Event) {
 function pageSizeInput(e: Event) {
   setPageSize(Number((e.target as HTMLInputElement).value));
 }
+
+// Where downloads go, and the free space there.
+const paths = ref<StoragePaths | null>(null);
+const cacheFree = ref<number | null>(null);
+async function loadPaths(p?: StoragePaths) {
+  try {
+    paths.value = p ?? (await api.storagePaths());
+    cacheFree.value = (await api.cacheFreeSpace("portal")).free;
+  } catch {
+    cacheFree.value = null;
+  }
+}
+watch(
+  () => props.open,
+  (o) => {
+    if (o) void loadPaths();
+  },
+  { immediate: true }
+);
 
 function connectionsInput(e: Event) {
   const input = e.target as HTMLInputElement;
@@ -124,6 +146,21 @@ function connectionsInput(e: Event) {
                   <span class="col-label">{{ o.label }}</span>
                 </label>
               </div>
+            </section>
+            <section>
+              <h4>Download folder</h4>
+              <p class="hint">
+                <em>Download to cache</em> saves files here, in <span class="mono">portal/</span> and
+                <span class="mono">s3-cache/</span>. Pick a disk with room for large datasets. Files already
+                downloaded stay in the previous folder.
+              </p>
+              <FolderSetting
+                :current="paths?.cacheDir ?? null"
+                :fallback="paths?.cacheDirDefault ?? null"
+                :apply="api.setCacheDir"
+                @changed="loadPaths"
+              />
+              <p v-if="cacheFree !== null" class="hint-sm">{{ fmtBytes(cacheFree) }} free on this disk.</p>
             </section>
             <section>
               <h4>Parallel download connections</h4>

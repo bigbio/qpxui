@@ -118,14 +118,15 @@ pub enum CacheKind {
 }
 
 impl CacheKind {
-    /// `<cache dir>/qpxui/portal` or `<cache dir>/qpxui/s3-cache`.
+    /// `<download cache>/portal` or `<download cache>/s3-cache`, the cache
+    /// folder being the one chosen in Settings (default
+    /// `<user cache folder>/qpxui`).
     pub fn root(self) -> Result<PathBuf, String> {
-        let base = dirs::cache_dir().ok_or_else(|| "no cache directory available".to_string())?;
         let sub = match self {
             CacheKind::Portal => "portal",
             CacheKind::S3 => "s3-cache",
         };
-        Ok(base.join("qpxui").join(sub))
+        Ok(crate::config::cache_dir()?.join(sub))
     }
 }
 

@@ -2,7 +2,9 @@
 // Settings → Diagnostics: the app log, to look at and to share with the
 // developers when something is slow or fails.
 import { computed, onMounted, ref } from "vue";
+import { api, type StoragePaths } from "../lib/api";
 import { readLog, setDetailedLogging, type LogInfo } from "../lib/log";
+import FolderSetting from "./FolderSetting.vue";
 import { saveText } from "../lib/export";
 import { setDetailedLog, settings } from "../lib/settings";
 
@@ -18,9 +20,12 @@ const preview = computed(() => {
   return lines.slice(-PREVIEW_LINES).join("\n");
 });
 
+const paths = ref<StoragePaths | null>(null);
+
 async function refresh() {
   error.value = "";
   try {
+    paths.value = await api.storagePaths();
     info.value = await readLog();
   } catch (e: any) {
     error.value = String(e?.message ?? e);
@@ -93,6 +98,13 @@ onMounted(refresh);
         what was slow, then save the log.
       </span>
     </label>
+    <h4 class="sub">Log folder</h4>
+    <FolderSetting
+      :current="paths?.logDir ?? null"
+      :fallback="paths?.logDirDefault ?? null"
+      :apply="api.setLogDir"
+      @changed="refresh"
+    />
     <div class="path">
       <span class="hint-sm">Log file:</span>
       <span class="mono">{{ info?.path ?? "not available" }}</span>
@@ -125,6 +137,10 @@ onMounted(refresh);
   align-items: flex-start;
   font-size: 13px;
   margin-bottom: 10px;
+}
+.sub {
+  font-size: 13px;
+  margin: 12px 0 6px;
 }
 .path {
   display: flex;
