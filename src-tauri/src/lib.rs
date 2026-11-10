@@ -1,4 +1,5 @@
 mod commands;
+mod config;
 mod logging;
 mod qpx;
 
@@ -14,7 +15,18 @@ pub fn run() {
             // Detailed from the start when asked for (QPX_LOG=debug); the
             // Diagnostics setting switches it later.
             let detailed = std::env::var("QPX_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
-            logging::init(app.path().app_log_dir().ok(), detailed);
+            let loaded = config::init(
+                app.path().app_config_dir().ok(),
+                app.path().app_log_dir().ok(),
+            );
+            logging::init(config::log_dir(), detailed);
+            if let Err(e) = loaded {
+                log::warn!("{e}");
+            }
+            log::info!(
+                "download cache folder: {}",
+                config::cache_dir().unwrap_or_default().display()
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -39,6 +51,9 @@ pub fn run() {
             logging::log_read,
             logging::log_set_detailed,
             logging::log_write,
+            config::storage_paths,
+            config::set_cache_dir,
+            config::set_log_dir,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

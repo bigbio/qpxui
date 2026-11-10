@@ -305,8 +305,9 @@ pub async fn cache_s3_views(
     let client = client_for_bucket(&bucket).await;
     let root = CacheKind::S3.root()?;
     // Once per run; a failed cleanup is reported and tried again next time.
+    // Only in the default folder: a folder the user picked is never cleaned.
     static CLEANED: Mutex<bool> = Mutex::new(false);
-    {
+    if crate::config::cache_dir_is_default() {
         let mut cleaned = CLEANED.lock().unwrap();
         if !*cleaned {
             cleanup_legacy_cache(&root)?;
