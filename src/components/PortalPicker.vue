@@ -1,23 +1,42 @@
 <script setup lang="ts">
 // The quantms portal source: the dataset registry, and the shared view list
 // of the dataset (run) picked in it.
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { api, portalRef, type PortalDataset } from "../lib/api";
 import PortalDatasetHead from "./portal/PortalDatasetHead.vue";
 import PortalRegistry from "./portal/PortalRegistry.vue";
 import PortalViews from "./PortalViews.vue";
+import { enrichPortalMethods } from "../lib/portalMethods";
 
 const rows = ref<PortalDataset[]>([]);
 const selected = ref<PortalDataset | null>(null);
 const busy = ref(false);
 const error = ref("");
+const methodsLoading = ref(false);
+const methodsError = ref("");
+let unmounted = false;
+onBeforeUnmount(() => { unmounted = true; });
+
+async function loadMethods() {
+  methodsLoading.value = true;
+  methodsError.value = "";
+  try {
+    await enrichPortalMethods(rows.value, api.portalMethodMetadata, () => {}, () => !unmounted);
+  } catch (e: unknown) {
+    if (!unmounted) methodsError.value = `Method filters unavailable: ${String(e)}`;
+  } finally {
+    if (!unmounted) methodsLoading.value = false;
+  }
+}
 
 async function loadRegistry() {
   busy.value = true;
   error.value = "";
   try {
     rows.value = await api.portalRegistry();
+    if (unmounted) return;
     selected.value = rows.value[0] ?? null;
+    void loadMethods();
   } catch (e: any) {
     error.value = String(e);
   } finally {
@@ -50,12 +69,12 @@ onMounted(loadRegistry);
 
     <div v-if="rows.length" class="layout">
       <!-- Left: searchable registry -->
-      <PortalRegistry :rows="rows" :selected="selected" @select="selectDataset" />
+      <PortalRegistry :rows="rows" :selected="selected" :methods-loading="methodsLoading" :methods-error="methodsError" @select="selectDataset" />
 
       <!-- Right: selected dataset's views -->
       <div class="detail">
         <template v-if="selected">
-          <PortalDatasetHead :ds="selected" />
+          <PortalDatasetHead :ds="selected" :methods-loading="methodsLoading" />
 
           <PortalViews
             :key="portalRef(selected)"

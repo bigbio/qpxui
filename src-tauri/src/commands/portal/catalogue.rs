@@ -1,6 +1,7 @@
 //! The portal's dataset catalogue API: the registry, search and facets.
 
 use crate::commands::portal_http;
+use crate::commands::portal_metadata::{self, PortalMethods};
 use reqwest::Client;
 
 /// Registry metadata for a reanalysed dataset on the quantms portal.
@@ -46,6 +47,8 @@ pub struct PortalDataset {
     pub publication: Option<Publication>,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default, flatten)]
+    pub methods: PortalMethods,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -139,6 +142,7 @@ pub(super) async fn registry(
             .then_with(|| key(a).cmp(&key(b)))
     });
     all.dedup_by(|a, b| key(a) == key(b));
+    portal_metadata::apply_cached(&mut all).await;
     Ok(all)
 }
 
@@ -167,6 +171,55 @@ struct SearchPageRaw {
     sort: String,
 }
 
+fn matches_method(types: &[String], value: &str) -> bool {
+    if types.is_empty() {
+        value == "Unknown"
+    } else {
+        types.iter().any(|t| t.eq_ignore_ascii_case(value))
+    }
+}
+
+fn filtered_page(
+    mut datasets: Vec<PortalDataset>,
+    instruments: Option<&[String]>,
+    quantification: Option<&str>,
+    acquisition: Option<&str>,
+    page: usize,
+    page_size: usize,
+    sort: String,
+) -> PortalSearchResult {
+    datasets.retain(|ds| {
+        instruments
+            .map(|values| {
+                ds.instrument
+                    .as_ref()
+                    .map(|i| values.contains(i))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(true)
+            && quantification
+                .map(|value| matches_method(&ds.methods.quantification_types, value))
+                .unwrap_or(true)
+            && acquisition
+                .map(|value| matches_method(&ds.methods.acquisition_types, value))
+                .unwrap_or(true)
+    });
+    let total = datasets.len();
+    let total_pages = total.div_ceil(page_size).max(1);
+    let page = page.clamp(1, total_pages);
+    PortalSearchResult {
+        datasets: datasets
+            .into_iter()
+            .skip((page - 1) * page_size)
+            .take(page_size)
+            .collect(),
+        total,
+        page,
+        total_pages,
+        sort,
+    }
+}
+
 /// Facet options shown in the discover UI. Organisms and instruments come from
 /// `/facets`, collections from `/collections` (name + title).
 #[derive(Debug, serde::Serialize)]
@@ -190,16 +243,25 @@ pub struct CollectionOption {
 /// organism, instrument, sort); count/lower-bound filters are not available
 /// server-side, so the caller combines this with client-side sorting if needed.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Named IPC filters preserve the existing command contract.
 pub async fn portal_search(
     query: Option<String>,
     collection: Option<String>,
     organism: Option<String>,
     instrument: Option<String>,
+    instruments: Option<Vec<String>>,
+    quantification: Option<String>,
+    acquisition: Option<String>,
     sort: Option<String>,
     page: Option<usize>,
     page_size: Option<usize>,
 ) -> Result<PortalSearchResult, String> {
     let client = portal_http::client()?;
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 100);
+    let quantification = quantification.filter(|v| !v.is_empty());
+    let acquisition = acquisition.filter(|v| !v.is_empty());
+    let local_filters = instruments.is_some() || quantification.is_some() || acquisition.is_some();
 
     let mut url = reqwest::Url::parse("https://api.quantms.org/dataset-search/datasets")
         .map_err(|e| format!("bad search URL: {e}"))?;
@@ -215,23 +277,64 @@ pub async fn portal_search(
         add("organism", organism.as_deref());
         add("instrument", instrument.as_deref());
         add("sort", sort.as_deref());
-        qp.append_pair("page", &page.unwrap_or(1).max(1).to_string());
+        qp.append_pair("page", &if local_filters { 1 } else { page }.to_string());
         qp.append_pair(
             "page_size",
-            &page_size.unwrap_or(50).clamp(1, 100).to_string(),
+            &if local_filters { 100 } else { page_size }.to_string(),
         );
     }
 
-    let raw = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request: {e:?}"))?
-        .error_for_status()
-        .map_err(|e| format!("http: {e}"))?
-        .json::<SearchPageRaw>()
-        .await
-        .map_err(|e| format!("parse: {e}"))?;
+    let mut raw: SearchPageRaw = get_json(&client, url.as_str()).await?;
+    if local_filters {
+        if instruments.as_ref().is_some_and(|v| v.is_empty()) {
+            return Ok(filtered_page(
+                Vec::new(),
+                instruments.as_deref(),
+                quantification.as_deref(),
+                acquisition.as_deref(),
+                page,
+                page_size,
+                raw.sort,
+            ));
+        }
+        // Filter unions across the complete result set before paging: the API
+        // accepts only one exact instrument and no method-type filters.
+        let mut datasets = raw.datasets;
+        for p in 2..=raw.total_pages {
+            let mut next = url.clone();
+            let params: Vec<(String, String)> = next
+                .query_pairs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string(),
+                        if k == "page" {
+                            p.to_string()
+                        } else {
+                            v.to_string()
+                        },
+                    )
+                })
+                .collect();
+            next.query_pairs_mut().clear().extend_pairs(params);
+            let page: SearchPageRaw = get_json(&client, next.as_str()).await?;
+            datasets.extend(page.datasets);
+        }
+        if quantification.is_some() || acquisition.is_some() {
+            portal_metadata::enrich(&mut datasets, &client).await;
+        } else {
+            portal_metadata::apply_cached(&mut datasets).await;
+        }
+        return Ok(filtered_page(
+            datasets,
+            instruments.as_deref(),
+            quantification.as_deref(),
+            acquisition.as_deref(),
+            page,
+            page_size,
+            raw.sort,
+        ));
+    }
+    portal_metadata::apply_cached(&mut raw.datasets).await;
 
     Ok(PortalSearchResult {
         datasets: raw.datasets,
@@ -287,6 +390,106 @@ pub async fn portal_facets() -> Result<PortalFacets, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_instrument_filters_before_paginating_and_keeps_raw_values() {
+        let datasets = || {
+            (0..125)
+                .map(|i| {
+                    serde_json::from_value::<PortalDataset>(serde_json::json!({
+                        "accession": format!("PXD{i:06}"),
+                        "instrument": if i < 100 { "Model A" } else { "NT=Model B;AC=MS:2" },
+                    }))
+                    .unwrap()
+                })
+                .collect()
+        };
+        let selected = vec!["NT=Model B;AC=MS:2".to_string()];
+        let result = filtered_page(
+            datasets(),
+            Some(&selected),
+            None,
+            None,
+            2,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(result.total, 25);
+        assert_eq!(result.total_pages, 2);
+        assert_eq!(result.page, 2);
+        assert_eq!(result.datasets.len(), 5);
+        assert_eq!(result.datasets[0].accession, "PXD000120");
+        let union = filtered_page(
+            datasets(),
+            Some(&["Model A".into(), selected[0].clone()]),
+            None,
+            None,
+            1,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(union.total, 125);
+        let plain = filtered_page(
+            datasets(),
+            Some(&["Model B".into()]),
+            None,
+            None,
+            1,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(plain.total, 0);
+        let empty = filtered_page(datasets(), Some(&[]), None, None, 1, 20, "peptides".into());
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.total_pages, 1);
+    }
+
+    #[test]
+    fn portal_metadata_combined_filters_keep_mixed_and_unknown_datasets() {
+        let datasets = || {
+            serde_json::from_value::<Vec<PortalDataset>>(serde_json::json!([
+            {"accession": "A", "instrument": "Model A", "quantificationTypes": ["TMT"], "acquisitionTypes": ["DDA"]},
+            {"accession": "B", "instrument": "Model A", "quantificationTypes": ["TMT", "SILAC"], "acquisitionTypes": ["DIA"]},
+            {"accession": "C", "instrument": "Model B", "quantificationTypes": ["Label-free"], "acquisitionTypes": ["DDA"]},
+            {"accession": "D", "instrument": "Model A", "metadataError": "HTTP 404"}
+        ])).unwrap()
+        };
+        let combined = filtered_page(
+            datasets(),
+            Some(&["Model A".into()]),
+            Some("TMT"),
+            Some("dda"),
+            1,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(combined.total, 1);
+        assert_eq!(combined.datasets[0].accession, "A");
+        let mixed = filtered_page(
+            datasets(),
+            None,
+            Some("SILAC"),
+            None,
+            1,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(mixed.datasets[0].accession, "B");
+        let unknown = filtered_page(
+            datasets(),
+            None,
+            Some("Unknown"),
+            Some("Unknown"),
+            1,
+            20,
+            "peptides".into(),
+        );
+        assert_eq!(unknown.total, 1);
+        assert_eq!(unknown.datasets[0].accession, "D");
+        let json = serde_json::to_value(&combined.datasets[0]).unwrap();
+        assert_eq!(json["quantificationTypes"], serde_json::json!(["TMT"]));
+        assert_eq!(json["acquisitionTypes"], serde_json::json!(["DDA"]));
+    }
 
     async fn json_case(
         responses: Vec<(&str, &str)>,

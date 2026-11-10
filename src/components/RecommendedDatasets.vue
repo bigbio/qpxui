@@ -1,12 +1,30 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { api, portalRef, type PortalDataset } from "../lib/api";
 import { fmtCount } from "../lib/format";
 import PortalViews from "./PortalViews.vue";
+import { ontologyName } from "../lib/ontology";
+import { enrichPortalMethods } from "../lib/portalMethods";
+import PortalMethods from "./PortalMethods.vue";
 
 const datasets = ref<PortalDataset[]>([]);
 const busy = ref(false);
 const error = ref("");
+const methodsLoading = ref(false);
+const methodsError = ref("");
+let unmounted = false;
+onBeforeUnmount(() => { unmounted = true; });
+
+async function loadMethods() {
+  methodsLoading.value = true;
+  try {
+    await enrichPortalMethods(datasets.value, api.portalMethodMetadata, () => {}, () => !unmounted);
+  } catch (e: unknown) {
+    if (!unmounted) methodsError.value = `Method metadata unavailable: ${String(e)}`;
+  } finally {
+    if (!unmounted) methodsLoading.value = false;
+  }
+}
 
 const selected = ref<PortalDataset | null>(null);
 
@@ -32,6 +50,7 @@ async function loadRecommended() {
     const byRef = new Map<string, PortalDataset>();
     for (const d of pages.flatMap((p) => p.datasets)) if (!byRef.has(portalRef(d))) byRef.set(portalRef(d), d);
     datasets.value = [...byRef.values()].slice(0, 6);
+    if (!unmounted) void loadMethods();
   } catch (e: any) {
     error.value = String(e);
   } finally {
@@ -59,6 +78,7 @@ onMounted(() => {
     <div v-if="error" class="error">{{ error }}</div>
     <div v-else-if="busy" class="muted">Loading recommended datasets… <span class="spinner"></span></div>
     <div v-else-if="!datasets.length" class="muted">No featured datasets available.</div>
+    <div v-if="methodsError" class="error" role="alert">{{ methodsError }}</div>
 
     <div v-if="datasets.length" class="list">
       <article v-for="ds in datasets" :key="portalRef(ds)" class="row" :class="{ open: isOpen(ds) }">
@@ -69,10 +89,11 @@ onMounted(() => {
             <span class="title">{{ ds.title || ds.accession }}</span>
             <span class="sub muted">
               <span v-if="ds.organism">{{ ds.organism }}</span>
-              <span v-if="ds.instrument"> · {{ ds.instrument }}</span>
+              <span v-if="ds.instrument"> · {{ ontologyName(ds.instrument) }}</span>
               <span v-if="ds.samples"> · {{ ds.samples }} samples</span>
               <span v-if="ds.collectionTitle"> · {{ ds.collectionTitle }}</span>
             </span>
+            <span class="sub muted"><PortalMethods :dataset="ds" :loading="methodsLoading" /></span>
           </span>
           <span class="counts">
             <span title="Proteins"><b>{{ fmtCount(ds.proteins) }}</b> proteins</span>

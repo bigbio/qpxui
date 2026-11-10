@@ -1,16 +1,39 @@
 <script setup lang="ts">
 // The portal picker's searchable, sortable list of registry datasets.
-import { computed, ref } from "vue";
-import { portalRef, type PortalDataset } from "../../lib/api";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { api, portalRef, type PortalDataset } from "../../lib/api";
 import { fmtCount, fmtBytes } from "../../lib/format";
 import { REGISTRY_SORTS as SORTS, filterRegistry, nextSort, type RegistrySort } from "../../lib/registry";
+import { buildInstrumentTree, ontologyName, selectedInstruments, type InstrumentTerm } from "../../lib/ontology";
+import { matchesMethod, methodTypes } from "../../lib/portalMethods";
+import InstrumentFilter from "../InstrumentFilter.vue";
+import PortalMethods from "../PortalMethods.vue";
 
-const props = defineProps<{ rows: PortalDataset[]; selected: PortalDataset | null }>();
+const props = defineProps<{ rows: PortalDataset[]; selected: PortalDataset | null; methodsLoading?: boolean; methodsError?: string }>();
 const emit = defineEmits<{ (e: "select", ds: PortalDataset): void }>();
 
 const query = ref("");
 const sortKey = ref<RegistrySort>("accession");
 const sortDesc = ref(false);
+const instrument = ref("");
+const quantification = ref("");
+const acquisition = ref("");
+const instrumentTerms = ref<InstrumentTerm[]>([]);
+const ontologyLoading = ref(true);
+const ontologyError = ref("");
+const instrumentTree = computed(() => buildInstrumentTree(
+  instrumentTerms.value, [...new Set(props.rows.flatMap((r) => r.instrument ? [r.instrument] : []))],
+));
+const quantificationTypes = computed(() => [...new Set(props.rows.flatMap((r) => methodTypes(r.quantificationTypes)))].sort());
+const acquisitionTypes = computed(() => [...new Set(props.rows.flatMap((r) => methodTypes(r.acquisitionTypes)))].sort());
+let unmounted = false;
+onBeforeUnmount(() => { unmounted = true; });
+onMounted(() => {
+  api.portalInstrumentTerms()
+    .then((terms) => { if (!unmounted) instrumentTerms.value = terms; })
+    .catch((e: unknown) => { if (!unmounted) ontologyError.value = `Instrument hierarchy unavailable: ${String(e)}`; })
+    .finally(() => { if (!unmounted) ontologyLoading.value = false; });
+});
 
 function setSort(k: RegistrySort) {
   const s = nextSort({ key: sortKey.value, desc: sortDesc.value }, k);
@@ -18,7 +41,14 @@ function setSort(k: RegistrySort) {
   sortDesc.value = s.desc;
 }
 
-const filtered = computed(() => filterRegistry(props.rows, query.value, sortKey.value, sortDesc.value));
+const filtered = computed(() => {
+  const instruments = selectedInstruments(instrumentTree.value, instrument.value);
+  return filterRegistry(props.rows, query.value, sortKey.value, sortDesc.value).filter((r) =>
+    (instruments === null || (!!r.instrument && instruments.includes(r.instrument)))
+    && matchesMethod(r.quantificationTypes, quantification.value)
+    && matchesMethod(r.acquisitionTypes, acquisition.value)
+  );
+});
 </script>
 
 <template>
@@ -29,6 +59,20 @@ const filtered = computed(() => filterRegistry(props.rows, query.value, sortKey.
       type="search"
       placeholder="Search datasets (accession, title, organism, instrument)…"
     />
+    <div class="filters">
+      <InstrumentFilter v-model="instrument" :tree="instrumentTree" :loading="ontologyLoading" :error="ontologyError" />
+      <select v-model="quantification" :disabled="methodsLoading || !!methodsError" aria-label="Quantification type" title="Quantification family derived from sample labels">
+        <option value="">Any quantification</option>
+        <option v-for="type in quantificationTypes" :key="type" :value="type">{{ type }}</option>
+      </select>
+      <select v-model="acquisition" :disabled="methodsLoading || !!methodsError" aria-label="Acquisition type">
+        <option value="">Any acquisition</option>
+        <option v-for="type in acquisitionTypes" :key="type" :value="type">{{ type }}</option>
+      </select>
+      <button @click="instrument = ''; quantification = ''; acquisition = ''; query = ''">Reset filters</button>
+    </div>
+    <div v-if="methodsLoading" class="muted sub">Loading method filters in the background...</div>
+    <div v-if="methodsError" class="error" role="alert">{{ methodsError }}</div>
     <div class="sortbar">
       <span class="muted">Sort</span>
       <button
@@ -61,10 +105,11 @@ const filtered = computed(() => filterRegistry(props.rows, query.value, sortKey.
         <div class="muted sub" v-if="r.organism || r.instrument">
           <span v-if="r.organism">{{ r.organism }}</span>
           <template v-if="r.organism && r.instrument"> · </template>
-          <span v-if="r.instrument">{{ r.instrument }}</span>
+          <span v-if="r.instrument">{{ ontologyName(r.instrument) }}</span>
           <template v-if="r.samples"> · {{ r.samples }} samples</template>
         </div>
         <div class="counts">
+          <PortalMethods :dataset="r" :loading="methodsLoading" />
           <span :class="{ hi: sortKey === 'peptides' }" title="Distinct peptides">{{ fmtCount(r.peptides) }} pep</span>
           <span :class="{ hi: sortKey === 'psmCount' }" title="PSMs">{{ fmtCount(r.psmCount) }} PSM</span>
           <span :class="{ hi: sortKey === 'proteins' }" title="Proteins">{{ fmtCount(r.proteins) }} prot</span>
@@ -85,6 +130,12 @@ const filtered = computed(() => filterRegistry(props.rows, query.value, sortKey.
 }
 .search {
   width: 100%;
+}
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
 }
 .meta {
   margin: 8px 0;

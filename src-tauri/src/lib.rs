@@ -25,6 +25,8 @@ pub fn run() {
             commands::portal::catalogue::portal_registry,
             commands::portal::catalogue::portal_search,
             commands::portal::catalogue::portal_facets,
+            commands::portal_ontology::portal_instrument_terms,
+            commands::portal_metadata::portal_method_metadata,
             commands::portal::listing::portal_list_views,
             commands::portal::download::portal_cache_views,
             commands::peptide_search::ps_search,

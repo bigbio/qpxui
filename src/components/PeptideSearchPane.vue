@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ontologyName } from "../lib/ontology";
 import { computed, onMounted, ref } from "vue";
 import { api, type PsHit, type PsModification, type PsSearchResult } from "../lib/api";
 import { fmtCount } from "../lib/format";
@@ -158,7 +159,7 @@ onMounted(async () => {
             <div class="sub muted">
               <span v-if="h.organism">{{ h.organism }}</span>
               <span v-if="h.organismPart"> · {{ h.organismPart }}</span>
-              <span v-if="h.instrument"> · {{ h.instrument }}</span>
+              <span v-if="h.instrument"> · {{ ontologyName(h.instrument) }}</span>
             </div>
             <div class="counts">
               <span class="stat" title="Distinct peptides"><b>{{ fmtCount(h.nPeptides) }}</b> pep</span>

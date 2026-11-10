@@ -3,8 +3,10 @@
 // organism and instrument, and its size and counts.
 import type { PortalDataset } from "../../lib/api";
 import { fmtBytes } from "../../lib/format";
+import { ontologyName } from "../../lib/ontology";
+import PortalMethods from "../PortalMethods.vue";
 
-defineProps<{ ds: PortalDataset }>();
+defineProps<{ ds: PortalDataset; methodsLoading?: boolean }>();
 </script>
 
 <template>
@@ -13,9 +15,10 @@ defineProps<{ ds: PortalDataset }>();
     <div class="title">{{ ds.title || ds.accession }}</div>
     <div class="muted" v-if="ds.organism || ds.instrument || ds.samples">
       <span v-if="ds.organism">{{ ds.organism }}</span>
-      <span v-if="ds.instrument"> · {{ ds.instrument }}</span>
+      <span v-if="ds.instrument"> · {{ ontologyName(ds.instrument) }}</span>
       <span v-if="ds.samples"> · {{ ds.samples }} samples</span>
     </div>
+    <div class="muted"><PortalMethods :dataset="ds" :loading="methodsLoading" /></div>
     <div class="stats">
       <div><b>{{ fmtBytes(ds.totalSize) }}</b><span class="muted">size</span></div>
       <div><b>{{ ds.peptides?.toLocaleString() ?? "—" }}</b><span class="muted">peptides</span></div>
