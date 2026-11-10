@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Settings modal, in tabs: Appearance (theme + PTM colours), Data & download
 // (heavy columns loaded by default, parallel download connections), Advanced
-// (browse page size, …).
+// (browse page size, …), Diagnostics (the app log).
 import { ref } from "vue";
 import {
   PTM_PALETTE,
@@ -17,11 +17,12 @@ import {
   settings,
 } from "../lib/settings";
 import { OPTIONAL_COLUMNS } from "../lib/queries/table";
+import DiagnosticsPanel from "./DiagnosticsPanel.vue";
 
 defineProps<{ open: boolean }>();
 const emit = defineEmits<{ (e: "close"): void }>();
 
-const tab = ref<"appearance" | "data" | "advanced">("appearance");
+const tab = ref<"appearance" | "data" | "advanced" | "diagnostics">("appearance");
 
 function pick(id: string, e: Event) {
   const val = (e.target as HTMLInputElement).value;
@@ -53,6 +54,7 @@ function connectionsInput(e: Event) {
           <button :class="{ active: tab === 'appearance' }" @click="tab = 'appearance'">Appearance</button>
           <button :class="{ active: tab === 'data' }" @click="tab = 'data'">Data &amp; download</button>
           <button :class="{ active: tab === 'advanced' }" @click="tab = 'advanced'">Advanced</button>
+          <button :class="{ active: tab === 'diagnostics' }" @click="tab = 'diagnostics'">Diagnostics</button>
         </nav>
 
         <div class="body">
@@ -144,6 +146,8 @@ function connectionsInput(e: Event) {
               </div>
             </section>
           </template>
+
+          <DiagnosticsPanel v-else-if="tab === 'diagnostics'" />
 
           <!-- Advanced: other configurable options -->
           <template v-else>

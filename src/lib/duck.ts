@@ -2,6 +2,7 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import { reactive } from "vue";
 import { api, type ViewInfo } from "./api";
 import { CANCELLED, engineErrorText } from "./errors";
+import { logQuery } from "./log";
 
 // Bundle the engine and workers here; predev/prebuild also fetch the signed
 // Parquet extension into public/, so local queries need no runtime downloads.
@@ -241,9 +242,12 @@ function normalize(v: unknown): unknown {
 }
 
 /** Dev builds keep a log of query timings in `window.__qlog`. */
-function logQuery(sql: string, ms: number, rows: number) {
-  const w = window as any;
-  (w.__qlog ??= []).push({ ms: Math.round(ms), rows, sql: sql.replace(/\s+/g, " ").trim() });
+function recordQuery(sql: string, ms: number, rows: number, error?: string) {
+  logQuery(sql, ms, rows, error);
+  if (import.meta.env.DEV) {
+    const w = window as any;
+    (w.__qlog ??= []).push({ ms: Math.round(ms), rows, sql: sql.replace(/\s+/g, " ").trim() });
+  }
 }
 
 type QueryResultType = Awaited<ReturnType<duckdb.AsyncDuckDBConnection["query"]>>;
@@ -270,11 +274,13 @@ export async function runSql(
     const c = conn!;
     res = await tracked(() => c.query(sql));
   } catch (e) {
-    throw new Error(engineErrorText(e));
+    const text = engineErrorText(e);
+    recordQuery(sql, performance.now() - t0, 0, text);
+    throw new Error(text);
   } finally {
     if (import.meta.env.DEV) w.__qpending--;
   }
-  if (import.meta.env.DEV) logQuery(sql, performance.now() - t0, res.numRows);
+  recordQuery(sql, performance.now() - t0, res.numRows);
   const truncated = res.numRows > maxRows;
   const table = truncated ? res.slice(0, maxRows) : res;
   // Columns come from the schema, so an empty result keeps them, and values

@@ -60,6 +60,8 @@ export interface SettingsState {
   pageSize: number;
   /** Parallel connections per "Download to cache" run (clamped 1–16). */
   downloadConnections: number;
+  /** Detailed logging: every query and streamed range goes to the log. */
+  detailedLog: boolean;
 }
 
 /** Default and bounds of {@link SettingsState.downloadConnections}; the Rust
@@ -67,7 +69,7 @@ export interface SettingsState {
 export const DOWNLOAD_CONNECTIONS = { default: 8, min: 1, max: 16 };
 
 function defaults(): SettingsState {
-  return { theme: "light", ptmColors: {}, columns: {}, viewColumns: {}, pageSize: 500, downloadConnections: DOWNLOAD_CONNECTIONS.default };
+  return { theme: "light", ptmColors: {}, columns: {}, viewColumns: {}, pageSize: 500, downloadConnections: DOWNLOAD_CONNECTIONS.default, detailedLog: false };
 }
 
 function load(): SettingsState {
@@ -155,6 +157,12 @@ export function setViewColumnShown(viewPath: string, col: string, shown: boolean
 export function setPageSize(n: number) {
   const v = Math.round(Number(n));
   settings.pageSize = Number.isFinite(v) ? Math.max(20, Math.min(2000, v)) : 500;
+  persist();
+}
+
+/** Turn detailed logging on or off, and remember it. */
+export function setDetailedLog(on: boolean) {
+  settings.detailedLog = on;
   persist();
 }
 

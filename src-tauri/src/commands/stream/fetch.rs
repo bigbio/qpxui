@@ -128,6 +128,30 @@ pub(super) async fn http_range(
 
 /// Fetch one inclusive byte range from the object's source.
 async fn fetch(obj: &Object, start: u64, end: u64) -> Result<Bytes, String> {
+    let t0 = std::time::Instant::now();
+    let r = fetch_source(obj, start, end).await;
+    let ms = t0.elapsed().as_millis();
+    match &r {
+        // A slow fetch is worth seeing without detailed logging.
+        Ok(d) if ms >= 3000 => log::info!(
+            "slow fetch {} bytes {start}-{end} ({} KB): {ms} ms",
+            obj.path,
+            d.len() / 1024
+        ),
+        Ok(d) => log::debug!(
+            "fetched {} bytes {start}-{end} ({} KB) in {ms} ms",
+            obj.path,
+            d.len() / 1024
+        ),
+        Err(e) => log::warn!(
+            "fetch {} bytes {start}-{end} failed after {ms} ms: {e}",
+            obj.path
+        ),
+    }
+    r
+}
+
+async fn fetch_source(obj: &Object, start: u64, end: u64) -> Result<Bytes, String> {
     let range = format!("bytes={start}-{end}");
     let data = match &obj.source {
         Source::S3 {

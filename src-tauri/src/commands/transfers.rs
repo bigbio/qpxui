@@ -414,6 +414,7 @@ async fn fetch_range(
                 if failures >= SEGMENT_ATTEMPTS {
                     return Err(format!("{e} (after {SEGMENT_ATTEMPTS} attempts)"));
                 }
+                log::warn!("range from byte {pos}: {e}; retrying ({failures}/{SEGMENT_ATTEMPTS})");
                 let wait = std::time::Duration::from_millis(500 << failures.min(4));
                 cancellable(token, async {
                     tokio::time::sleep(wait).await;
@@ -519,6 +520,20 @@ pub async fn download(
         ),
     };
     let ranges = segments(total, ranged, slots.connections);
+    let t0 = std::time::Instant::now();
+    log::info!(
+        "download {name}: {} MB, {}",
+        total >> 20,
+        if ranges.is_empty() {
+            "one stream".to_string()
+        } else {
+            format!(
+                "{} ranges over {} connections",
+                ranges.len(),
+                slots.connections
+            )
+        }
+    );
     let fetch = |start: u64, end: Option<u64>| {
         let (part, meter) = (&part, &meter);
         async move {
@@ -536,6 +551,12 @@ pub async fn download(
         return Err(format!("{name}: got {got} of {total} bytes"));
     }
     part.finish().await?;
+    let secs = t0.elapsed().as_secs_f64();
+    log::info!(
+        "download {name}: done, {} MB in {secs:.1} s ({:.1} MB/s)",
+        got >> 20,
+        got as f64 / secs.max(1e-3) / 1e6
+    );
     if let Some(app) = app {
         progress::done(app, &batch.id, name, got);
     }

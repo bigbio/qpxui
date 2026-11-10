@@ -84,12 +84,6 @@ pub(super) async fn handle(
         );
     }
     let range = range.flatten();
-    log::debug!(
-        "{} {} range={range:?} size={}",
-        req.method(),
-        obj.path,
-        obj.size
-    );
     let (start, end) = range.unwrap_or((0, obj.size.saturating_sub(1)));
     let len = if obj.size == 0 { 0 } else { end - start + 1 };
 
@@ -118,8 +112,17 @@ pub(super) async fn handle(
     if len == 0 {
         return Ok(b.body(Full::new(Bytes::new())).unwrap());
     }
+    let t0 = std::time::Instant::now();
     match read_range(&p, &id, &obj, start, end).await {
-        Ok(data) => Ok(b.body(Full::new(data)).unwrap()),
+        Ok(data) => {
+            log::debug!(
+                "served {} bytes {start}-{end} ({} KB) in {} ms",
+                obj.path,
+                len / 1024,
+                t0.elapsed().as_millis()
+            );
+            Ok(b.body(Full::new(data)).unwrap())
+        }
         Err(e) => {
             log::warn!("stream {}: {e}", obj.path);
             Ok(plain(StatusCode::BAD_GATEWAY, e))

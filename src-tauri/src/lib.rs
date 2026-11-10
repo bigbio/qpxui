@@ -1,4 +1,5 @@
 mod commands;
+mod logging;
 mod qpx;
 
 pub use commands::stream::register::{
@@ -6,10 +7,16 @@ pub use commands::stream::register::{
 };
 
 pub fn run() {
-    env_logger::init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            use tauri::Manager;
+            // Detailed from the start when asked for (QPX_LOG=debug); the
+            // Diagnostics setting switches it later.
+            let detailed = std::env::var("QPX_LOG").is_ok_and(|v| v.eq_ignore_ascii_case("debug"));
+            logging::init(app.path().app_log_dir().ok(), detailed);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::sources::open_file,
             commands::sources::scan_collection,
@@ -29,6 +36,9 @@ pub fn run() {
             commands::portal::download::portal_cache_views,
             commands::peptide_search::ps_search,
             commands::peptide_search::ps_modifications,
+            logging::log_read,
+            logging::log_set_detailed,
+            logging::log_write,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
