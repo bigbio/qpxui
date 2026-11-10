@@ -148,6 +148,7 @@ mod tests {
                 source: Source::Local { path: file },
                 fetched: AtomicU64::new(0),
                 requests: AtomicU64::new(0),
+                layout: Default::default(),
             }),
         );
         let client = reqwest::Client::new();

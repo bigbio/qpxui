@@ -20,6 +20,7 @@
 //! - `fetch`: reading ranges from S3, HTTPS or disk through the block cache.
 
 mod fetch;
+mod readahead;
 pub mod register;
 mod server;
 
@@ -36,8 +37,12 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
 
-/// In-memory cache budget (in blocks) shared by all streamed objects.
-const CACHE_BLOCKS: usize = 2048;
+/// In-memory cache budget (in blocks) shared by all streamed objects:
+/// 8192 x 64 KB = 512 MB.
+const CACHE_BLOCKS: usize = 8192;
+
+/// A range fetch in flight, shared by every request that needs its blocks.
+type Pending = futures::future::Shared<futures::future::BoxFuture<'static, Result<Bytes, String>>>;
 
 /// Where a streamed object's bytes come from.
 enum Source {
@@ -69,6 +74,8 @@ struct Object {
     source: Source,
     fetched: AtomicU64,
     requests: AtomicU64,
+    /// Column chunk layout from the parquet footer, read on first use.
+    layout: OnceCell<Option<Arc<readahead::Layout>>>,
 }
 
 struct Proxy {
@@ -76,6 +83,8 @@ struct Proxy {
     token: String,
     objects: Mutex<HashMap<String, Arc<Object>>>,
     cache: Mutex<LruCache<(String, u64), Bytes>>,
+    /// Blocks being fetched: block -> (first block of its run, the fetch).
+    inflight: Mutex<HashMap<(String, u64), (u64, Pending)>>,
 }
 
 static PROXY: OnceCell<Arc<Proxy>> = OnceCell::const_new();
@@ -114,6 +123,7 @@ async fn start() -> Result<Arc<Proxy>, String> {
         token: random_token(),
         objects: Mutex::new(HashMap::new()),
         cache: Mutex::new(LruCache::new(NonZeroUsize::new(CACHE_BLOCKS).unwrap())),
+        inflight: Mutex::new(HashMap::new()),
     });
     let served = p.clone();
     tokio::spawn(async move {
