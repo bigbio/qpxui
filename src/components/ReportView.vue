@@ -3,7 +3,7 @@ import { computed, ref, watch } from "vue";
 import { openReport, state, type ReportTab } from "../store";
 import type { DatasetInfo } from "../lib/api";
 import { datasetTables, evidence, proteinExpr, viewScale, type DatasetTables, type TableRef } from "../lib/report";
-import { countValue, datasetMeta, kpiSources, runInstrumentsEnzymes, sampleOrganisms } from "../lib/queries/header";
+import { catalogCount, countValue, datasetMeta, kpiSources, runInstrumentsEnzymes, sampleOrganisms } from "../lib/queries/header";
 import { quantSource } from "../lib/queries/quant";
 import { fmtShort } from "../lib/format";
 import { saveText } from "../lib/export";
@@ -141,14 +141,18 @@ async function loadHeader(t: DatasetTables, id: number) {
     list.push(k);
     kpis.value = [...list];
   };
-  // Distinct counts read whole columns; on a large streamed view they wait
-  // for a click. Plain row counts come from the parquet footer.
+  // Distinct counts read whole columns; on a large streamed view they come
+  // from the portal catalogue when it has them, or wait for a click. Plain
+  // row counts come from the parquet footer.
   for (const s of kpiSources(t)) {
     const k = { key: s.key, label: s.label, ...(s.title ? { title: s.title } : {}) };
     const run = () => countValue(ds, s);
+    const known = catalogCount(ds, s);
     let value: Kpi;
     try {
       if (s.kind === "count") value = { ...k, value: await run() };
+      else if (known !== null && (await isLarge(s.ref)))
+        value = { ...k, value: known, title: `${known.toLocaleString()} (from the quantms portal catalogue)` };
       else if (s.kind === "rows") value = { ...k, value: (await isLarge(s.ref)) ? await footerRows(s.ref) : await run() };
       else if (await isLarge(s.ref)) value = { ...k, value: null, defer: run, title: "Large streamed view: click to count (reads a whole column)" };
       else value = { ...k, value: await run() };

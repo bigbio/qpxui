@@ -233,6 +233,7 @@ const hasNext = computed(() => page.value < results.value.totalPages);
           :dataset-ref="portalRef(ds)"
           :organism="ds.organism"
           :psm-count="ds.psmCount"
+          :catalog="ds"
           :disabled="busy"
         />
       </article>

@@ -49,6 +49,17 @@ export function kpiSources(t: DatasetTables): KpiSource[] {
   return out;
 }
 
+/** A whole-column count the portal catalogue already has for this dataset,
+ * so the header need not scan a large streamed view for it. Only counts that
+ * mean the same thing: distinct proteins from the evidence view (not the pg
+ * view's protein groups) and distinct peptides. */
+export function catalogCount(ds: DatasetInfo, s: KpiSource): number | null {
+  const c = ds.catalog;
+  if (!c || s.kind !== "distinct") return null;
+  const v = s.cacheKey === "kpi.prot" ? c.proteins : s.cacheKey === "kpi.pep" ? c.peptides : null;
+  return typeof v === "number" && v > 0 ? v : null;
+}
+
 /** A count's value; failures are shown beside that count in the header. */
 export async function countValue(ds: DatasetInfo, s: KpiSource): Promise<number> {
   const r = await cachedSql(ds, s.cacheKey, s.sql);
