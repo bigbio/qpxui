@@ -171,6 +171,17 @@ async function register(view: ViewInfo, table: string): Promise<void> {
   await conn.query(
     `CREATE OR REPLACE VIEW "${table}" AS SELECT * FROM read_parquet('${fileKey}')`
   );
+  // The same rows with their position in the file (`file_row_number`), so
+  // one row can be read again by number: DuckDB then reads only its row
+  // group instead of searching the whole file.
+  await conn.query(
+    `CREATE OR REPLACE VIEW "${rowsView(table)}" AS SELECT * FROM read_parquet('${fileKey}', file_row_number = true)`
+  );
+}
+
+/** The view of `table` with a `file_row_number` column. */
+export function rowsView(table: string): string {
+  return `${table}__rn`;
 }
 
 async function initDb(): Promise<{ db: duckdb.AsyncDuckDB; conn: duckdb.AsyncDuckDBConnection }> {

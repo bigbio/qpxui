@@ -327,4 +327,21 @@ mod tests {
         );
         assert!(out.status.success());
     }
+
+    /// Serve HuiYan-E480-P1 through the proxy for 30 minutes and print its
+    /// URL and the proxy stats every 5 s, for benchmarks in a browser.
+    /// `cargo test live_stream_serve -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_stream_serve() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let url = "https://browse.quantms.org/quantms/datasets/HuiYan-E480/392295b50151/HuiYan-E480-P1.psm.parquet".to_string();
+        let handles = register_http(std::slice::from_ref(&url)).await.unwrap();
+        println!("URL {}", handles[&url].url);
+        for _ in 0..360 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let s = &stats()[&url];
+            println!("STATS {} {}", s.requests, s.fetched_bytes);
+        }
+    }
 }

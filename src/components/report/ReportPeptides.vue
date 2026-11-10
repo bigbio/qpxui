@@ -128,6 +128,7 @@ function openSpectrum(row: Record<string, any>) {
     run_file_name: row.run_file_name ?? null,
     scan: row.scan_no ?? null,
     charge: row.charge ?? null,
+    row: row.file_row_number == null ? null : Number(row.file_row_number),
   };
 }
 

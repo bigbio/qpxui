@@ -234,13 +234,7 @@ pub(super) async fn read_range(
     let data = read_blocks(p, id, obj, start, end, true)
         .await?
         .ok_or_else(|| format!("short read for {}", obj.path))?;
-    tokio::spawn(super::readahead::read_ahead(
-        p.clone(),
-        id.to_string(),
-        obj.clone(),
-        start,
-        end,
-    ));
+    super::readahead::read_ahead(p, id, obj, start, end);
     Ok(data)
 }
 

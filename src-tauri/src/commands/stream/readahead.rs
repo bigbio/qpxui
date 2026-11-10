@@ -29,6 +29,18 @@ pub(super) struct Chunk {
     pub column: usize,
 }
 
+/// How DuckDB has been reading one column: the last row group it read, and
+/// how many row groups in a row it has read up to it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Streak {
+    group: usize,
+    run: usize,
+}
+
+/// Row groups of a column read in a row before it counts as a scan. Two are
+/// not enough: reading one row by number also reads the group before it.
+const SCAN_GROUPS: usize = 3;
+
 /// Where the column chunks of a parquet file lie.
 #[derive(Debug)]
 pub(super) struct Layout {
@@ -36,13 +48,19 @@ pub(super) struct Layout {
     by_start: Vec<Chunk>,
     /// `grid[group][column]`: the chunk of each column in each row group.
     grid: Vec<Vec<Chunk>>,
+    /// Per column, how DuckDB has been reading it.
+    streaks: std::sync::Mutex<std::collections::HashMap<usize, Streak>>,
 }
 
 impl Layout {
     pub fn new(grid: Vec<Vec<Chunk>>) -> Self {
         let mut by_start: Vec<Chunk> = grid.iter().flatten().copied().collect();
         by_start.sort_by_key(|c| c.start);
-        Self { by_start, grid }
+        Self {
+            by_start,
+            grid,
+            streaks: Default::default(),
+        }
     }
 
     /// The layout described by a parquet footer (the metadata bytes between
@@ -84,16 +102,35 @@ impl Layout {
     }
 
     /// Byte ranges to warm after DuckDB read `start..=end`: for every column
-    /// the read touched, the same column in the following row groups, up to
-    /// [`AHEAD_BYTES`] and [`AHEAD_GROUPS`] per column.
+    /// the read touched that DuckDB is scanning (it read the previous row
+    /// group of it too), the same column in the following row groups, up to
+    /// [`AHEAD_BYTES`] and [`AHEAD_GROUPS`] per column. Columns read only
+    /// here and there (DuckDB fetches the non-filter columns of a filtered
+    /// query only where the filter matches) are never read ahead.
     pub fn ahead(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        // Last row group read per column.
+        // Last row group read per column. A chunk counts as read when the
+        // request starts in it or covers it whole: a read running a few bytes
+        // into the next column's chunk does not make that column a scan.
         let mut last: Vec<(usize, usize)> = Vec::new();
-        for c in self.overlapping(start, end) {
+        let read =
+            |c: &&Chunk| (c.start <= start && start <= c.end) || (start <= c.start && c.end <= end);
+        for c in self.overlapping(start, end).filter(read) {
             match last.iter_mut().find(|(col, _)| *col == c.column) {
                 Some((_, g)) => *g = (*g).max(c.group),
                 None => last.push((c.column, c.group)),
             }
+        }
+        {
+            let mut streaks = self.streaks.lock().unwrap();
+            last.retain(|&(column, group)| {
+                let s = streaks.entry(column).or_insert(Streak { group, run: 1 });
+                // The same chunk again (more of its pages) keeps the streak.
+                if s.group != group {
+                    s.run = if s.group + 1 == group { s.run + 1 } else { 1 };
+                    s.group = group;
+                }
+                s.run >= SCAN_GROUPS
+            });
         }
         let mut out = Vec::new();
         for (column, group) in last {
@@ -155,24 +192,36 @@ async fn layout(p: &Arc<Proxy>, id: &str, obj: &Arc<Object>) -> Option<Arc<Layou
         .clone()
 }
 
-/// After DuckDB read `start..=end`, warm the next chunks of the same columns.
-pub(super) async fn read_ahead(p: Arc<Proxy>, id: String, obj: Arc<Object>, start: u64, end: u64) {
-    let Some(layout) = layout(&p, &id, &obj).await else {
-        return;
+/// After DuckDB read `start..=end`, warm the next chunks of the columns it
+/// is scanning, in the background. The plan is made here, in the order
+/// DuckDB's reads arrive, so its streaks are tracked exactly. Returns the
+/// background task (awaited in tests).
+pub(super) fn read_ahead(
+    p: &Arc<Proxy>,
+    id: &str,
+    obj: &Arc<Object>,
+    start: u64,
+    end: u64,
+) -> tokio::task::JoinHandle<()> {
+    let (p, id, obj) = (p.clone(), id.to_string(), obj.clone());
+    let Some(Some(layout)) = obj.layout.get().cloned() else {
+        // First reads (the footer): load the layout for the next ones.
+        return tokio::spawn(async move {
+            layout(&p, &id, &obj).await;
+        });
     };
     let ranges = layout.ahead(start, end);
-    if ranges.is_empty() {
-        return;
-    }
-    use futures::stream::{self, StreamExt};
-    let warms: Vec<_> = ranges
-        .into_iter()
-        .map(|(s, e)| warm(p.clone(), id.clone(), obj.clone(), s, e))
-        .collect();
-    stream::iter(warms)
-        .buffer_unordered(PREFETCH_FETCHES)
-        .for_each(|()| async {})
-        .await;
+    tokio::spawn(async move {
+        use futures::stream::{self, StreamExt};
+        let warms: Vec<_> = ranges
+            .into_iter()
+            .map(|(s, e)| warm(p.clone(), id.clone(), obj.clone(), s, e))
+            .collect();
+        stream::iter(warms)
+            .buffer_unordered(PREFETCH_FETCHES)
+            .for_each(|()| async {})
+            .await;
+    })
 }
 
 /// Bring `start..=end` into the block cache. Cached or in-flight blocks are
@@ -211,10 +260,20 @@ mod tests {
         )
     }
 
+    /// Scan `column` of `l` from row group 0 to `group - 1`, so the next
+    /// read of it is a continued scan.
+    fn scan_to(l: &Layout, column: usize, group: usize) {
+        for g in 0..group {
+            let c = l.grid[g][column];
+            l.ahead(c.start, c.end);
+        }
+    }
+
     #[test]
     fn reads_ahead_the_columns_a_read_touched() {
         let l = grid(10, 3, 100);
-        // Column 1 of row group 2.
+        // Column 1 of row group 2, after groups 0 and 1.
+        scan_to(&l, 1, 2);
         let c = l.grid[2][1];
         let ahead = l.ahead(c.start + 10, c.start + 20);
         let want: Vec<_> = (3..10)
@@ -222,6 +281,8 @@ mod tests {
             .collect();
         assert_eq!(ahead, want);
         // A read across columns 0 and 1 of row group 8 warms both in group 9.
+        l.ahead(l.grid[6][0].start, l.grid[6][1].end);
+        l.ahead(l.grid[7][0].start, l.grid[7][1].end);
         let ahead = l.ahead(l.grid[8][0].start, l.grid[8][1].end);
         assert_eq!(
             ahead,
@@ -238,15 +299,59 @@ mod tests {
     #[test]
     fn read_ahead_is_bounded() {
         let l = grid(200, 2, 1 << 20);
-        let c = l.grid[0][0];
+        scan_to(&l, 0, 2);
+        let c = l.grid[2][0];
         assert_eq!(l.ahead(c.start, c.end).len(), 32, "AHEAD_BYTES");
         let small = grid(200, 2, 1000);
-        let c = small.grid[0][0];
+        scan_to(&small, 0, 2);
+        let c = small.grid[2][0];
         assert_eq!(small.ahead(c.start, c.end).len(), AHEAD_GROUPS);
         // Chunks over the budget (peak arrays) are never read ahead.
         let huge = grid(5, 1, AHEAD_BYTES + 1);
-        let c = huge.grid[0][0];
+        scan_to(&huge, 0, 2);
+        let c = huge.grid[2][0];
         assert!(huge.ahead(c.start, c.end).is_empty());
+    }
+
+    #[test]
+    fn reading_into_the_next_chunk_does_not_read_it_ahead() {
+        let l = grid(10, 2, 100);
+        // Column 0 of groups 0 to 2, each read running 8 bytes into column 1.
+        for g in 0..3 {
+            let c = l.grid[g][0];
+            let ahead = l.ahead(c.start, c.end + 8);
+            if g == 2 {
+                assert!(
+                    ahead
+                        .iter()
+                        .all(|&(s, _)| l.grid.iter().any(|rg| rg[0].start == s)),
+                    "{ahead:?}"
+                );
+                assert_eq!(ahead.len(), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn only_scanned_columns_are_read_ahead() {
+        let l = grid(50, 2, 100);
+        // A first read, and reads here and there (lazily fetched columns of a
+        // filtered query), warm nothing.
+        for g in [0, 7, 20, 31] {
+            let c = l.grid[g][1];
+            assert!(l.ahead(c.start, c.end).is_empty(), "group {g}");
+        }
+        // Two row groups in a row are not a scan yet (a row read by number
+        // reads its group and the one before); three are, and more pages of
+        // the same chunk keep it.
+        let c = l.grid[32][1];
+        assert!(l.ahead(c.start, c.end).is_empty());
+        let c = l.grid[33][1];
+        assert!(!l.ahead(c.start, c.start + 10).is_empty());
+        assert!(!l.ahead(c.start + 20, c.end).is_empty());
+        // A jump ends the scan.
+        let c = l.grid[40][1];
+        assert!(l.ahead(c.start, c.end).is_empty());
     }
 
     #[test]
@@ -339,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn later_row_groups_of_a_read_column_come_from_the_cache() {
-        use super::super::{fetch::read_range, Source};
+        use super::super::Source;
         use std::sync::atomic::{AtomicU64, Ordering};
         let file = test_parquet(12, 20_000);
         let (url, served) = range_server(file.clone()).await;
@@ -366,13 +471,19 @@ mod tests {
             layout: Default::default(),
         });
         let l = layout(&p, "x", &obj).await.expect("layout");
-        let a0 = l.grid[0][0];
-        let got = read_range(&p, "x", &obj, a0.start, a0.end).await.unwrap();
-        assert_eq!(&got[..], &file[a0.start as usize..=a0.end as usize]);
-        // What the spawned read-ahead does, awaited here.
-        read_ahead(p.clone(), "x".into(), obj.clone(), a0.start, a0.end).await;
+        // DuckDB scans column a: row groups 0 to 2, then read-ahead (what
+        // read_range starts in the background, awaited here).
+        for g in 0..3 {
+            let c = l.grid[g][0];
+            let got = read_blocks(&p, "x", &obj, c.start, c.end, true)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&got[..], &file[c.start as usize..=c.end as usize]);
+            read_ahead(&p, "x", &obj, c.start, c.end).await.unwrap();
+        }
         let before = served.load(Ordering::SeqCst);
-        for g in 1..12 {
+        for g in 3..12 {
             let c = l.grid[g][0];
             let d = read_blocks(&p, "x", &obj, c.start, c.end, true)
                 .await
