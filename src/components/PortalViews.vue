@@ -3,7 +3,7 @@
 // in place or download them to the cache. Unmounting (the dataset closed, or
 // hidden by a new search) cancels a running download.
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { api, type DatasetInfo, type ViewInfo } from "../lib/api";
+import { api, type CatalogStats, type DatasetInfo, type ViewInfo } from "../lib/api";
 import { loadDatasets } from "../store";
 import { confirmDownload, totalBytes, useDownload } from "../lib/downloads";
 import { fmtBytes } from "../lib/format";
@@ -15,6 +15,8 @@ const props = defineProps<{
   datasetRef: string;
   organism?: string | null;
   psmCount?: number | null;
+  /** The dataset's counts in the portal catalogue, if known. */
+  catalog?: CatalogStats | null;
   /** The recommended strip: with no view ticked, actions take all views. */
   featured?: boolean;
   /** The parent list is searching: hold the actions until it is done. */
@@ -53,11 +55,19 @@ function toggleAll() {
   for (const v of views.value) checked.value[v.path] = !allOn;
 }
 
+/** Views whose rows the catalogue counts describe. */
+const EVIDENCE = new Set(["psm", "feature"]);
+
 function open(list: ViewInfo[], label: string) {
+  const names = new Set(list.map((v) => v.name));
+  // The catalogue counts the whole dataset: keep them only when every
+  // evidence file is open, so they match what the report shows.
+  const whole = views.value.filter((v) => EVIDENCE.has(v.view)).every((v) => names.has(v.name));
   const ds: DatasetInfo = {
     prefix: props.accession,
     path: `quantms portal / ${props.datasetRef}`,
     views: list.sort((a, b) => a.view.localeCompare(b.view)),
+    ...(whole && props.catalog ? { catalog: props.catalog } : {}),
   };
   loadDatasets([ds], label);
 }

@@ -19,6 +19,17 @@ export interface DatasetInfo {
   prefix: string;
   path: string;
   views: ViewInfo[];
+  /** Counts from the quantms portal catalogue, set when every evidence view
+   * of a portal dataset was opened (so they describe the views shown). */
+  catalog?: CatalogStats;
+}
+
+/** Whole-dataset counts the portal catalogue already knows. */
+export interface CatalogStats {
+  proteins?: number | null;
+  peptides?: number | null;
+  psmCount?: number | null;
+  samples?: number | null;
 }
 
 export interface SkippedFolder {

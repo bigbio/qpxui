@@ -63,6 +63,7 @@ onMounted(loadRegistry);
             :dataset-ref="portalRef(selected)"
             :organism="selected.organism"
             :psm-count="selected.psmCount"
+            :catalog="selected"
           />
         </template>
         <div v-else class="muted">Select a dataset from the registry.</div>

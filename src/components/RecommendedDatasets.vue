@@ -88,6 +88,7 @@ onMounted(() => {
           :dataset-ref="portalRef(ds)"
           :organism="ds.organism"
           :psm-count="ds.psmCount"
+          :catalog="ds"
           featured
         />
       </article>

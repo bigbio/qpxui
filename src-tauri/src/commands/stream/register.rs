@@ -295,9 +295,13 @@ mod tests {
         let url = "https://browse.quantms.org/quantms/datasets/HuiYan-E480/392295b50151/HuiYan-E480-P1.psm.parquet".to_string();
         let handles = register_http(std::slice::from_ref(&url)).await.unwrap();
         let proxied = handles[&url].url.clone();
+        // `QPX_SQL` overrides the query; `{t}` stands for the proxied file.
+        let query = std::env::var("QPX_SQL").unwrap_or_else(|_| {
+            "SELECT charge, count(*) FROM {t} WHERE NOT is_decoy GROUP BY 1 ORDER BY 1;".into()
+        });
         let sql = format!(
-            "SET threads=1; SET enable_http_metadata_cache=false; \
-             SELECT charge, count(*) FROM read_parquet('{proxied}') WHERE NOT is_decoy GROUP BY 1 ORDER BY 1;"
+            "SET threads=1; SET enable_http_metadata_cache=false; {}",
+            query.replace("{t}", &format!("read_parquet('{proxied}')"))
         );
         let t = std::time::Instant::now();
         let out = tokio::task::spawn_blocking(move || {
