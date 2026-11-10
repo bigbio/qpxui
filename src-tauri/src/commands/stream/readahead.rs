@@ -50,6 +50,8 @@ pub(super) struct Layout {
     grid: Vec<Vec<Chunk>>,
     /// Per column, how DuckDB has been reading it.
     streaks: std::sync::Mutex<std::collections::HashMap<usize, Streak>>,
+    /// Bytes of each chunk (row group, column) DuckDB's reads have covered.
+    covered: std::sync::Mutex<std::collections::HashMap<(usize, usize), u64>>,
 }
 
 impl Layout {
@@ -60,6 +62,7 @@ impl Layout {
             by_start,
             grid,
             streaks: Default::default(),
+            covered: Default::default(),
         }
     }
 
@@ -108,13 +111,24 @@ impl Layout {
     /// here and there (DuckDB fetches the non-filter columns of a filtered
     /// query only where the filter matches) are never read ahead.
     pub fn ahead(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        // Last row group read per column. A chunk counts as read when the
-        // request starts in it or covers it whole: a read running a few bytes
-        // into the next column's chunk does not make that column a scan.
+        // Last row group read per column. duckdb-wasm reads aligned blocks
+        // (16 to 256 KB) that take in the ends of neighbouring columns'
+        // chunks, so a chunk counts as read only once DuckDB's reads have
+        // covered at least half of it.
         let mut last: Vec<(usize, usize)> = Vec::new();
-        let read =
-            |c: &&Chunk| (c.start <= start && start <= c.end) || (start <= c.start && c.end <= end);
-        for c in self.overlapping(start, end).filter(read) {
+        let read: Vec<Chunk> = {
+            let mut covered = self.covered.lock().unwrap();
+            self.overlapping(start, end)
+                .filter(|c| {
+                    let overlap = end.min(c.end) - start.max(c.start) + 1;
+                    let seen = covered.entry((c.group, c.column)).or_insert(0);
+                    *seen += overlap;
+                    2 * *seen > c.end - c.start
+                })
+                .copied()
+                .collect()
+        };
+        for c in &read {
             match last.iter_mut().find(|(col, _)| *col == c.column) {
                 Some((_, g)) => *g = (*g).max(c.group),
                 None => last.push((c.column, c.group)),
@@ -275,7 +289,7 @@ mod tests {
         // Column 1 of row group 2, after groups 0 and 1.
         scan_to(&l, 1, 2);
         let c = l.grid[2][1];
-        let ahead = l.ahead(c.start + 10, c.start + 20);
+        let ahead = l.ahead(c.start + 10, c.start + 60);
         let want: Vec<_> = (3..10)
             .map(|g| (l.grid[g][1].start, l.grid[g][1].end))
             .collect();
@@ -333,6 +347,45 @@ mod tests {
     }
 
     #[test]
+    fn aligned_blocks_count_only_for_the_chunks_they_mostly_cover() {
+        // Column 1 is small and read; columns 0 and 2 are big neighbours whose
+        // ends DuckDB's aligned blocks take in.
+        let mut at = 0;
+        let grid = (0..10)
+            .map(|group| {
+                [10_000u64, 600, 10_000]
+                    .iter()
+                    .enumerate()
+                    .map(|(column, &n)| {
+                        let c = Chunk {
+                            start: at,
+                            end: at + n - 1,
+                            group,
+                            column,
+                        };
+                        at += n;
+                        c
+                    })
+                    .collect()
+            })
+            .collect();
+        let l = Layout::new(grid);
+        let mut ahead = Vec::new();
+        for g in 0..3 {
+            let c = l.grid[g][1];
+            // 256 bytes of column 0, all of column 1, 256 bytes of column 2.
+            ahead = l.ahead(c.start - 256, c.end + 256);
+        }
+        assert!(!ahead.is_empty());
+        assert!(
+            ahead
+                .iter()
+                .all(|&(s, _)| l.grid.iter().any(|rg| rg[1].start == s)),
+            "{ahead:?}"
+        );
+    }
+
+    #[test]
     fn only_scanned_columns_are_read_ahead() {
         let l = grid(50, 2, 100);
         // A first read, and reads here and there (lazily fetched columns of a
@@ -347,8 +400,12 @@ mod tests {
         let c = l.grid[32][1];
         assert!(l.ahead(c.start, c.end).is_empty());
         let c = l.grid[33][1];
-        assert!(!l.ahead(c.start, c.start + 10).is_empty());
-        assert!(!l.ahead(c.start + 20, c.end).is_empty());
+        assert!(
+            l.ahead(c.start, c.start + 10).is_empty(),
+            "under half of the chunk"
+        );
+        assert!(!l.ahead(c.start + 11, c.start + 60).is_empty());
+        assert!(!l.ahead(c.start + 61, c.end).is_empty());
         // A jump ends the scan.
         let c = l.grid[40][1];
         assert!(l.ahead(c.start, c.end).is_empty());

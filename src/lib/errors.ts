@@ -19,8 +19,9 @@ export function engineErrorText(e: unknown): string {
   if (/Range request for |Unexpected return status from server/.test(msg)) {
     return (
       `${msg}\n\n` +
-      "Hint: this looks like a failed remote (streamed) read — check your AWS credentials " +
-      "and network, or use “Download to cache” for this view instead."
+      "Hint: a remote (streamed) read failed — the remote storage was slow or unreachable " +
+      "(for S3, also check your AWS credentials). Try again, or use “Download to cache” " +
+      "for this view; Settings → Diagnostics → Save log shows what failed."
     );
   }
   return msg;
