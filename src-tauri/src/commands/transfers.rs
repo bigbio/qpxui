@@ -6,13 +6,12 @@
 
 use crate::commands::progress;
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::AppHandle;
-use tokio::io::AsyncWriteExt;
 
 static ACTIVE: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
@@ -180,55 +179,169 @@ pub fn ensure_space(dir: &Path, need: u64) -> Result<(), String> {
     check_fits(need, free_space(dir)?)
 }
 
-/// A download in progress: bytes go to `<final>.part`, which is renamed to the
-/// final name by [`PartFile::finish`]. Dropping it unfinished (error, cancel)
+/// Parallel connections used for one download batch when the frontend does
+/// not say. Remote storage (the portal's object store in particular) caps
+/// throughput per connection at a few MB/s, so several ranged requests at once
+/// are many times faster than one stream.
+pub const DEFAULT_CONNECTIONS: usize = 8;
+/// Upper bound on the user's "parallel connections" setting.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// The user's connection setting, clamped to `1..=MAX_CONNECTIONS`.
+pub fn connections(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_CONNECTIONS)
+        .clamp(1, MAX_CONNECTIONS)
+}
+
+/// Largest byte range fetched by one request. Big enough that per-request
+/// overhead (redirect, TLS reuse, headers) is noise; small enough that the
+/// last ranges of a file finish close together.
+const SEGMENT_MAX: u64 = 32 << 20;
+/// Smallest range worth its own request; files under two of these are fetched
+/// as a single stream.
+const SEGMENT_MIN: u64 = 4 << 20;
+/// Bytes received per connection before they are written to disk in one call.
+const WRITE_BUF: usize = 2 << 20;
+/// Minimum time between two progress events of one file. Events cross into
+/// the webview and re-render the progress bars; one per network chunk
+/// (~16 KB) cost more than the transfer itself.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+/// Tries per byte range that makes no progress before the download fails.
+/// A range that fails after receiving data resumes where it stopped.
+const SEGMENT_ATTEMPTS: usize = 4;
+
+/// A response body: a stream of byte chunks.
+pub type Body = futures::stream::BoxStream<'static, Result<Bytes, String>>;
+
+/// Where a download reads from (the portal over HTTPS, or S3).
+pub trait Source: Sync {
+    /// Open the inclusive byte range `start..=end`, or the whole object for
+    /// `None`. A ranged open must fail unless the server honoured the range.
+    fn open(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> futures::future::BoxFuture<'_, Result<Body, String>>;
+}
+
+/// Connection slots shared by every file of one batch, so a batch never opens
+/// more than the user's setting at once, whatever mix of files it holds.
+pub struct Slots {
+    sem: tokio::sync::Semaphore,
+    pub connections: usize,
+}
+
+impl Slots {
+    pub fn new(connections: usize) -> Self {
+        Self {
+            sem: tokio::sync::Semaphore::new(connections),
+            connections,
+        }
+    }
+}
+
+/// Byte ranges to fetch `total` bytes over `connections` connections, or an
+/// empty list when the file should come as a single stream (no range
+/// support, unknown or small size).
+fn segments(total: u64, ranged: bool, connections: usize) -> Vec<(u64, u64)> {
+    if !ranged || connections < 2 || total < 2 * SEGMENT_MIN {
+        return Vec::new();
+    }
+    // About two ranges per connection, so a slow range near the end does not
+    // leave the other connections idle for long.
+    let per = total.div_ceil(2 * connections as u64);
+    let size = per.clamp(SEGMENT_MIN, SEGMENT_MAX);
+    (0..total)
+        .step_by(size as usize)
+        .map(|s| (s, (s + size).min(total) - 1))
+        .collect()
+}
+
+/// A download in progress: bytes go to `<final>.part`, written at their
+/// offsets by any number of connections, and the file is renamed to the final
+/// name by [`PartFile::finish`]. Dropping it unfinished (error, cancel)
 /// deletes the partial file, so the cache never holds a truncated parquet.
 pub struct PartFile {
     part: PathBuf,
     dest: PathBuf,
-    file: Option<tokio::fs::File>,
-    pub written: u64,
+    file: Option<Arc<std::fs::File>>,
+}
+
+fn write_error(part: &Path, e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::StorageFull {
+        "Not enough disk space: the cache disk filled up during the download; the partial file was removed.".to_string()
+    } else {
+        format!("write {}: {e}", part.display())
+    }
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &std::fs::File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &std::fs::File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_write(buf, off)? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl PartFile {
-    pub async fn create(dest: &Path) -> Result<Self, String> {
+    /// Create `<dest>.part`, sized to `size` bytes when known so ranges can
+    /// be written anywhere in it.
+    pub async fn create(dest: &Path, size: u64) -> Result<Self, String> {
         let mut name = dest.file_name().unwrap_or_default().to_os_string();
         name.push(".part");
         let part = dest.with_file_name(name);
-        let file = tokio::fs::File::create(&part)
-            .await
-            .map_err(|e| format!("create {}: {e}", part.display()))?;
+        let path = part.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            let f = std::fs::File::create(&path)?;
+            if size > 0 {
+                f.set_len(size)?;
+            }
+            Ok::<_, std::io::Error>(f)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("create {}: {e}", part.display()))?;
         Ok(Self {
             part,
             dest: dest.to_path_buf(),
-            file: Some(file),
-            written: 0,
+            file: Some(Arc::new(file)),
         })
     }
 
-    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), String> {
-        let f = self.file.as_mut().ok_or("download already finished")?;
-        f.write_all(chunk).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::StorageFull {
-                "Not enough disk space: the cache disk filled up during the download; the partial file was removed.".to_string()
-            } else {
-                format!("write {}: {e}", self.part.display())
-            }
-        })?;
-        self.written += chunk.len() as u64;
-        Ok(())
+    /// Write `buf` at byte offset `off`, off the async runtime.
+    pub async fn write_at(&self, off: u64, buf: Vec<u8>) -> Result<(), String> {
+        let f = self.file.clone().ok_or("download already finished")?;
+        tokio::task::spawn_blocking(move || write_all_at(&f, &buf, off))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| write_error(&self.part, e))
     }
 
-    pub async fn finish(mut self) -> Result<u64, String> {
-        if let Some(mut f) = self.file.take() {
-            f.flush().await.map_err(|e| e.to_string())?;
-            f.sync_all().await.map_err(|e| e.to_string())?;
+    /// Flush to disk and move the file to its final name.
+    pub async fn finish(mut self) -> Result<(), String> {
+        if let Some(f) = self.file.take() {
+            tokio::task::spawn_blocking(move || f.sync_all())
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
         }
         tokio::fs::rename(&self.part, &self.dest)
             .await
             .map_err(|e| format!("rename {}: {e}", self.part.display()))?;
         self.part = PathBuf::new();
-        Ok(self.written)
+        Ok(())
     }
 }
 
@@ -241,44 +354,192 @@ impl Drop for PartFile {
     }
 }
 
-/// Stream one response body to `dest` through its `.part` file, reporting
-/// progress for `name` in `batch` and stopping once the batch is cancelled,
-/// also while the server stalls between chunks. `total` is the expected size,
-/// 0 if unknown.
-pub async fn save(
-    app: Option<&AppHandle>,
-    batch: &Batch,
-    name: &str,
-    dest: &Path,
+/// Bytes received for one file, reported to the frontend at most every
+/// [`PROGRESS_EVERY`].
+struct Meter<'a> {
+    app: Option<&'a AppHandle>,
+    batch: &'a str,
+    name: &'a str,
     total: u64,
-    body: impl Stream<Item = Result<Bytes, String>>,
-) -> Result<u64, String> {
-    let token = &batch.token;
-    let mut body = std::pin::pin!(body);
-    let mut part = PartFile::create(dest).await?;
+    done: AtomicU64,
+    last: Mutex<std::time::Instant>,
+}
+
+impl Meter<'_> {
+    fn add(&self, n: u64) {
+        let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
+        let Some(app) = self.app else { return };
+        let mut last = self.last.lock().expect("progress meter poisoned");
+        if last.elapsed() >= PROGRESS_EVERY {
+            *last = std::time::Instant::now();
+            drop(last);
+            progress::chunk(app, self.batch, self.name, done, self.total);
+        }
+    }
+}
+
+/// Why a range transfer stopped.
+enum Stop {
+    /// Cancelled, or a local failure (disk full): give up at once.
+    Fatal(String),
+    /// A network failure: worth retrying from where it stopped.
+    Retry(String),
+}
+
+/// Fetch `start..=end` (or the whole object when `end` is `None`) into
+/// `part`, retrying network failures and resuming after the bytes already
+/// received.
+async fn fetch_range(
+    src: &dyn Source,
+    part: &PartFile,
+    meter: &Meter<'_>,
+    token: &AtomicBool,
+    start: u64,
+    end: Option<u64>,
+) -> Result<(), String> {
+    let mut pos = start;
+    let mut failures = 0;
     loop {
-        let next = match tokio::time::timeout(POLL, body.next()).await {
-            Ok(next) => next,
-            Err(_) if is_cancelled(token) => return Err(CANCELLED.to_string()),
-            Err(_) => continue,
-        };
         if is_cancelled(token) {
             return Err(CANCELLED.to_string());
         }
-        let Some(chunk) = next else { break };
-        part.write(&chunk?).await?;
-        if let Some(app) = app {
-            progress::chunk(app, &batch.id, name, part.written, total);
+        let before = pos;
+        match pump(src, part, meter, token, &mut pos, end).await {
+            Ok(()) => return Ok(()),
+            Err(Stop::Fatal(e)) => return Err(e),
+            // Without a range the stream cannot resume part-way.
+            Err(Stop::Retry(e)) if end.is_none() => return Err(e),
+            Err(Stop::Retry(e)) => {
+                failures = if pos > before { 1 } else { failures + 1 };
+                if failures >= SEGMENT_ATTEMPTS {
+                    return Err(format!("{e} (after {SEGMENT_ATTEMPTS} attempts)"));
+                }
+                let wait = std::time::Duration::from_millis(500 << failures.min(4));
+                cancellable(token, async {
+                    tokio::time::sleep(wait).await;
+                    Ok(())
+                })
+                .await?;
+            }
         }
     }
-    if total > 0 && part.written != total {
-        return Err(format!("{name}: got {} of {total} bytes", part.written));
+}
+
+/// One request of [`fetch_range`]: stream from `*pos` to `end`, writing in
+/// [`WRITE_BUF`] blocks and advancing `*pos` past every byte received (and
+/// written, also when the request fails).
+async fn pump(
+    src: &dyn Source,
+    part: &PartFile,
+    meter: &Meter<'_>,
+    token: &AtomicBool,
+    pos: &mut u64,
+    end: Option<u64>,
+) -> Result<(), Stop> {
+    let range = end.map(|e| (*pos, e));
+    let mut body = cancellable(token, src.open(range)).await.map_err(|e| {
+        if e == CANCELLED {
+            Stop::Fatal(e)
+        } else {
+            Stop::Retry(e)
+        }
+    })?;
+    let mut buf: Vec<u8> = Vec::with_capacity(WRITE_BUF);
+    let mut buf_at = *pos;
+    let result = loop {
+        let next = match tokio::time::timeout(POLL, body.next()).await {
+            Ok(next) => next,
+            Err(_) if is_cancelled(token) => break Err(Stop::Fatal(CANCELLED.to_string())),
+            Err(_) => continue,
+        };
+        if is_cancelled(token) {
+            break Err(Stop::Fatal(CANCELLED.to_string()));
+        }
+        let chunk = match next {
+            None => break Ok(()),
+            Some(Err(e)) => break Err(Stop::Retry(e)),
+            Some(Ok(c)) => c,
+        };
+        if end.is_some_and(|e| *pos + chunk.len() as u64 > e + 1) {
+            break Err(Stop::Fatal(
+                "server sent more bytes than the range requested".to_string(),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+        *pos += chunk.len() as u64;
+        meter.add(chunk.len() as u64);
+        if buf.len() >= WRITE_BUF {
+            let full = std::mem::replace(&mut buf, Vec::with_capacity(WRITE_BUF));
+            part.write_at(buf_at, full).await.map_err(Stop::Fatal)?;
+            buf_at = *pos;
+        }
+    };
+    // Keep what was received, also before a retry resumes after it.
+    if !buf.is_empty() && !matches!(result, Err(Stop::Fatal(_))) {
+        part.write_at(buf_at, buf).await.map_err(Stop::Fatal)?;
     }
-    let done = part.finish().await?;
+    result?;
+    match end {
+        Some(e) if *pos != e + 1 => Err(Stop::Retry(format!(
+            "connection closed at byte {} of {}",
+            *pos,
+            e + 1
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Download one file from `src` to `dest` through its `.part` file, reporting
+/// progress for `name` in `batch`. `total` is the expected size (0 if
+/// unknown); when `ranged`, the file is fetched as byte ranges over the
+/// batch's connection `slots`, otherwise as one stream.
+#[allow(clippy::too_many_arguments)]
+pub async fn download(
+    app: Option<&AppHandle>,
+    batch: &Batch,
+    slots: &Slots,
+    src: &dyn Source,
+    name: &str,
+    dest: &Path,
+    total: u64,
+    ranged: bool,
+) -> Result<u64, String> {
+    let token = &batch.token;
+    let part = PartFile::create(dest, total).await?;
+    let meter = Meter {
+        app,
+        batch: &batch.id,
+        name,
+        total,
+        done: AtomicU64::new(0),
+        last: Mutex::new(
+            std::time::Instant::now()
+                .checked_sub(PROGRESS_EVERY)
+                .unwrap_or_else(std::time::Instant::now),
+        ),
+    };
+    let ranges = segments(total, ranged, slots.connections);
+    let fetch = |start: u64, end: Option<u64>| {
+        let (part, meter) = (&part, &meter);
+        async move {
+            let _slot = slots.sem.acquire().await.map_err(|e| e.to_string())?;
+            fetch_range(src, part, meter, token, start, end).await
+        }
+    };
+    if ranges.is_empty() {
+        fetch(0, None).await?;
+    } else {
+        futures::future::try_join_all(ranges.iter().map(|&(s, e)| fetch(s, Some(e)))).await?;
+    }
+    let got = meter.done.load(Ordering::Relaxed);
+    if total > 0 && got != total {
+        return Err(format!("{name}: got {got} of {total} bytes"));
+    }
+    part.finish().await?;
     if let Some(app) = app {
-        progress::done(app, &batch.id, name, done);
+        progress::done(app, &batch.id, name, got);
     }
-    Ok(done)
+    Ok(got)
 }
 
 #[derive(serde::Serialize)]
@@ -345,22 +606,195 @@ mod tests {
 
     #[tokio::test]
     async fn part_file_is_removed_unless_finished() {
-        let dir = std::env::temp_dir().join(format!("qpxui-part-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("x.feature.parquet");
-        let part = dir.join("x.feature.parquet.part");
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.feature.parquet");
+        let part = dir.path().join("x.feature.parquet.part");
 
-        let mut f = PartFile::create(&dest).await.unwrap();
-        f.write(b"abc").await.unwrap();
+        let f = PartFile::create(&dest, 3).await.unwrap();
+        f.write_at(0, b"abc".to_vec()).await.unwrap();
         assert!(part.exists());
         drop(f); // cancelled / failed
         assert!(!part.exists() && !dest.exists());
 
-        let mut f = PartFile::create(&dest).await.unwrap();
-        f.write(b"abcdef").await.unwrap();
-        assert_eq!(f.finish().await.unwrap(), 6);
+        // Ranges may land in any order.
+        let f = PartFile::create(&dest, 6).await.unwrap();
+        f.write_at(3, b"def".to_vec()).await.unwrap();
+        f.write_at(0, b"abc".to_vec()).await.unwrap();
+        f.finish().await.unwrap();
         assert!(!part.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"abcdef");
-        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ranges_cover_the_file_exactly() {
+        let mb = 1u64 << 20;
+        assert!(segments(100 * mb, false, 8).is_empty(), "no range support");
+        assert!(segments(100 * mb, true, 1).is_empty(), "one connection");
+        assert!(segments(7 * mb, true, 8).is_empty(), "small file");
+        for (total, conns) in [(8 * mb, 8), (100 * mb + 7, 8), (7_000 * mb + 1, 16)] {
+            let r = segments(total, true, conns);
+            assert!(r.len() >= 2);
+            assert_eq!(r[0].0, 0);
+            assert_eq!(r.last().unwrap().1, total - 1);
+            for w in r.windows(2) {
+                assert_eq!(w[0].1 + 1, w[1].0);
+            }
+            assert!(r.iter().all(|(s, e)| e - s < SEGMENT_MAX));
+        }
+    }
+
+    #[test]
+    fn connection_setting_is_clamped() {
+        assert_eq!(connections(None), DEFAULT_CONNECTIONS);
+        assert_eq!(connections(Some(0)), 1);
+        assert_eq!(connections(Some(99)), MAX_CONNECTIONS);
+        assert_eq!(connections(Some(4)), 4);
+    }
+
+    /// In-memory source: serves ranges in small chunks, counts concurrent
+    /// opens, and can drop the connection once after `fail_after` bytes.
+    struct Mem {
+        data: Arc<Vec<u8>>,
+        ranged: bool,
+        fail_after: Mutex<Option<usize>>,
+        open_now: Arc<std::sync::atomic::AtomicUsize>,
+        open_max: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Mem {
+        fn new(data: Vec<u8>, ranged: bool) -> Self {
+            Self {
+                data: Arc::new(data),
+                ranged,
+                fail_after: Mutex::new(None),
+                open_now: Default::default(),
+                open_max: Default::default(),
+            }
+        }
+    }
+
+    struct Open(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Open {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Source for Mem {
+        fn open(
+            &self,
+            range: Option<(u64, u64)>,
+        ) -> futures::future::BoxFuture<'_, Result<Body, String>> {
+            Box::pin(async move {
+                if range.is_some() && !self.ranged {
+                    return Err("HTTP 200: range ignored".into());
+                }
+                let (s, e) = range.unwrap_or((0, self.data.len() as u64 - 1));
+                let n = self.open_now.fetch_add(1, Ordering::SeqCst) + 1;
+                self.open_max.fetch_max(n, Ordering::SeqCst);
+                let guard = Open(self.open_now.clone());
+                let mut bytes = self.data[s as usize..=e as usize].to_vec();
+                let fail = self.fail_after.lock().unwrap().take();
+                let mut chunks: Vec<Result<Bytes, String>> = Vec::new();
+                if let Some(cut) = fail {
+                    bytes.truncate(cut);
+                }
+                for c in bytes.chunks(64 * 1024) {
+                    chunks.push(Ok(Bytes::copy_from_slice(c)));
+                }
+                if fail.is_some() {
+                    chunks.push(Err("connection reset".into()));
+                }
+                let body = futures::stream::iter(chunks).then(move |c| {
+                    let _keep = &guard;
+                    async move {
+                        tokio::task::yield_now().await;
+                        c
+                    }
+                });
+                Ok(body.boxed())
+            })
+        }
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn ranged_download_uses_parallel_connections() {
+        let data = pattern((40 << 20) + 12_345);
+        let src = Mem::new(data.clone(), true);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("big.psm.parquet");
+        let batch = begin("test-ranged");
+        let slots = Slots::new(4);
+        let n = download(
+            None,
+            &batch,
+            &slots,
+            &src,
+            "big",
+            &dest,
+            data.len() as u64,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        let max = src.open_max.load(Ordering::SeqCst);
+        assert!((2..=4).contains(&max), "{max} connections at once");
+    }
+
+    #[tokio::test]
+    async fn dropped_range_resumes_where_it_stopped() {
+        let data = pattern(20 << 20);
+        let src = Mem::new(data.clone(), true);
+        *src.fail_after.lock().unwrap() = Some(3 << 20);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.pg.parquet");
+        let batch = begin("test-resume");
+        download(
+            None,
+            &batch,
+            &Slots::new(2),
+            &src,
+            "x",
+            &dest,
+            data.len() as u64,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn unranged_source_streams_once() {
+        let data = pattern(9 << 20);
+        let src = Mem::new(data.clone(), false);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.pg.parquet");
+        let batch = begin("test-unranged");
+        download(None, &batch, &Slots::new(8), &src, "x", &dest, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(src.open_max.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn short_download_fails_and_leaves_no_file() {
+        let data = pattern(1000);
+        let src = Mem::new(data, false);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("x.pg.parquet");
+        let batch = begin("test-short");
+        let e = download(None, &batch, &Slots::new(8), &src, "x", &dest, 5000, false)
+            .await
+            .unwrap_err();
+        assert!(e.contains("got 1000 of 5000"), "{e}");
+        assert!(!dest.exists() && !dir.path().join("x.pg.parquet.part").exists());
     }
 }

@@ -58,10 +58,16 @@ export interface SettingsState {
   viewColumns: Record<string, Record<string, boolean>>;
   /** Rows per page in the Browse table (clamped 20–2000). */
   pageSize: number;
+  /** Parallel connections per "Download to cache" run (clamped 1–16). */
+  downloadConnections: number;
 }
 
+/** Default and bounds of {@link SettingsState.downloadConnections}; the Rust
+ * side clamps to the same range. */
+export const DOWNLOAD_CONNECTIONS = { default: 8, min: 1, max: 16 };
+
 function defaults(): SettingsState {
-  return { theme: "light", ptmColors: {}, columns: {}, viewColumns: {}, pageSize: 500 };
+  return { theme: "light", ptmColors: {}, columns: {}, viewColumns: {}, pageSize: 500, downloadConnections: DOWNLOAD_CONNECTIONS.default };
 }
 
 function load(): SettingsState {
@@ -77,7 +83,11 @@ function load(): SettingsState {
 export const settings = reactive<SettingsState>(load());
 
 export function persist() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    /* storage unavailable or full: the setting still applies this session */
+  }
 }
 
 /** Push the current theme onto <html> so the CSS variables switch. */
@@ -145,6 +155,14 @@ export function setViewColumnShown(viewPath: string, col: string, shown: boolean
 export function setPageSize(n: number) {
   const v = Math.round(Number(n));
   settings.pageSize = Number.isFinite(v) ? Math.max(20, Math.min(2000, v)) : 500;
+  persist();
+}
+
+/** Set the parallel connections used by downloads, clamped to a sane range. */
+export function setDownloadConnections(n: number) {
+  const v = Math.round(Number(n));
+  const { min, max } = DOWNLOAD_CONNECTIONS;
+  settings.downloadConnections = Number.isFinite(v) ? Math.max(min, Math.min(max, v)) : DOWNLOAD_CONNECTIONS.default;
   persist();
 }
 

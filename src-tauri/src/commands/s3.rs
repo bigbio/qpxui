@@ -2,7 +2,9 @@ use crate::commands::transfers::{self as xfers, CacheKind};
 use crate::qpx::{self, DatasetInfo, ViewInfo};
 use aws_config::meta::region::RegionProviderChain;
 use aws_config::BehaviorVersion;
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::Client;
+use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -223,15 +225,82 @@ fn cleanup_legacy_cache(root: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Size of an object still to download, or `None` when it is already cached.
+async fn head_size(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    local: &std::path::Path,
+    token: &std::sync::atomic::AtomicBool,
+) -> Result<Option<u64>, String> {
+    if local.exists() {
+        return Ok(None);
+    }
+    let head = xfers::cancellable(token, async {
+        client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| format!("S3 head {key}: {}", DisplayErrorContext(&e)))
+    })
+    .await?;
+    Ok(Some(head.content_length().unwrap_or(0).max(0) as u64))
+}
+
+/// One S3 object, fetched with ranged `GetObject` requests.
+struct S3Source<'a> {
+    client: &'a Client,
+    bucket: &'a str,
+    key: &'a str,
+}
+
+impl xfers::Source for S3Source<'_> {
+    fn open(
+        &self,
+        range: Option<(u64, u64)>,
+    ) -> futures::future::BoxFuture<'_, Result<xfers::Body, String>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get_object()
+                .bucket(self.bucket)
+                .key(self.key)
+                .set_range(range.map(|(s, e)| format!("bytes={s}-{e}")))
+                .send()
+                .await
+                .map_err(|e| format!("S3 get {}: {}", self.key, DisplayErrorContext(&e)))?;
+            if range.is_some() && resp.content_range().is_none() {
+                return Err(format!("S3 get {}: range ignored by the server", self.key));
+            }
+            let key = self.key.to_string();
+            let body = futures::stream::try_unfold(resp.body, move |mut body| {
+                let key = key.clone();
+                async move {
+                    let chunk = body
+                        .try_next()
+                        .await
+                        .map_err(|e| format!("S3 get {key}: {e}"))?;
+                    Ok(chunk.map(|c| (c, body)))
+                }
+            });
+            Ok(Box::pin(body) as xfers::Body)
+        })
+    }
+}
+
 /// Download the given `s3://bucket/key` parquet views to the local cache so
 /// the rest of the app can query them as ordinary local files. Reports live
-/// progress over the `download-progress` event for each file.
+/// progress over the `download-progress` event for each file. `connections`
+/// is the user's parallel-connections setting.
 #[tauri::command]
 pub async fn cache_s3_views(
     app: AppHandle,
     cancel_id: String,
     bucket: String,
     paths: Vec<String>,
+    connections: Option<usize>,
 ) -> Result<Vec<ViewInfo>, String> {
     let client = client_for_bucket(&bucket).await;
     let root = CacheKind::S3.root()?;
@@ -244,7 +313,17 @@ pub async fn cache_s3_views(
             *cleaned = true;
         }
     }
-    cache_s3_views_impl(Some(&app), &client, &root, cancel_id, bucket, paths).await
+    let connections = xfers::connections(connections);
+    cache_s3_views_impl(
+        Some(&app),
+        &client,
+        &root,
+        cancel_id,
+        bucket,
+        paths,
+        connections,
+    )
+    .await
 }
 
 /// Testable core of [`cache_s3_views`]: `app` may be `None`, and `client`
@@ -256,91 +335,80 @@ async fn cache_s3_views_impl(
     cancel_id: String,
     bucket: String,
     paths: Vec<String>,
+    connections: usize,
 ) -> Result<Vec<ViewInfo>, String> {
     std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
     let batch = xfers::begin(&cancel_id);
     let token = &batch.token;
 
-    // Size everything still to fetch first, so a download that cannot fit
-    // on the cache disk is refused before any byte is written. `None` marks
-    // a file that is already cached.
     let mut plan = Vec::new();
     for p in &paths {
-        if xfers::is_cancelled(token) {
-            return Err(xfers::CANCELLED.to_string());
-        }
         let key = p.trim_start_matches(&format!("s3://{bucket}/")).to_string();
         let name = key.rsplit_once('/').map_or(key.as_str(), |(_, n)| n);
         let (_, view, format) =
             qpx::parse_filename(name).ok_or_else(|| format!("not a QPX view file: {p}"))?;
         let name = name.to_string();
         let local = cache_path(root, &bucket, &key);
-        let size = if local.exists() {
-            None
-        } else {
-            let head = xfers::cancellable(token, async {
-                client
-                    .head_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .send()
-                    .await
-                    .map_err(|e| format!("S3 head {key}: {e}"))
-            })
-            .await?;
-            Some(head.content_length().unwrap_or(0).max(0) as u64)
-        };
-        plan.push((key, name, view, format, local, size));
+        plan.push((key, name, view, format, local));
     }
-    let need = plan
+    // Size everything still to fetch first (in parallel), so a download that
+    // cannot fit on the cache disk is refused before any byte is written.
+    // `None` marks a file that is already cached.
+    let bucket = bucket.as_str();
+    let probes: Vec<_> = plan
         .iter()
-        .filter_map(|item| item.5)
-        .fold(0u64, u64::saturating_add);
+        .map(|(key, .., local)| head_size(client, bucket, key, local, token))
+        .collect();
+    let sizes: Vec<Option<u64>> = futures::stream::iter(probes)
+        .buffered(connections)
+        .try_collect()
+        .await?;
+    let need = sizes
+        .iter()
+        .flatten()
+        .fold(0u64, |a, b| a.saturating_add(*b));
     xfers::ensure_space(root, need)?;
 
-    let mut out = Vec::new();
-    for (key, name, view, format, local, size) in plan {
-        if xfers::is_cancelled(token) {
-            return Err(xfers::CANCELLED.to_string());
-        }
-        let size_bytes = match size {
-            None => std::fs::metadata(&local)
-                .map_err(|e| format!("{}: {e}", local.display()))?
-                .len(),
-            Some(head) => {
-                if let Some(parent) = local.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    // All files share the batch's connections; small files go first.
+    let slots = xfers::Slots::new(connections);
+    let mut jobs: Vec<_> = plan.into_iter().zip(sizes).enumerate().collect();
+    jobs.sort_by_key(|(_, (_, size))| size.unwrap_or(0));
+    let (batch, slots) = (&batch, &slots);
+    let mut out = futures::future::try_join_all(jobs.into_iter().map(
+        |(i, ((key, name, view, format, local), size))| async move {
+            let size_bytes = match size {
+                None => std::fs::metadata(&local)
+                    .map_err(|e| format!("{}: {e}", local.display()))?
+                    .len(),
+                Some(total) => {
+                    if let Some(parent) = local.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    let src = S3Source {
+                        client,
+                        bucket,
+                        key: &key,
+                    };
+                    // S3 always answers ranges; a size of 0 (unknown) streams.
+                    xfers::download(app, batch, slots, &src, &name, &local, total, total > 0)
+                        .await?
                 }
-                let resp = xfers::cancellable(token, async {
-                    client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send()
-                        .await
-                        .map_err(|e| format!("S3 get {key}: {e}"))
-                })
-                .await?;
-                let key = &key;
-                let body = futures::stream::try_unfold(resp.body, move |mut body| async move {
-                    let chunk = body
-                        .try_next()
-                        .await
-                        .map_err(|e| format!("S3 get {key}: {e}"))?;
-                    Ok(chunk.map(|c| (c, body)))
-                });
-                xfers::save(app, &batch, &name, &local, head, body).await?
-            }
-        };
-        out.push(ViewInfo {
-            name,
-            view,
-            format,
-            path: local.to_string_lossy().to_string(),
-            size_bytes: Some(size_bytes),
-        });
-    }
-    Ok(out)
+            };
+            Ok::<_, String>((
+                i,
+                ViewInfo {
+                    name,
+                    view,
+                    format,
+                    path: local.to_string_lossy().to_string(),
+                    size_bytes: Some(size_bytes),
+                },
+            ))
+        },
+    ))
+    .await?;
+    out.sort_by_key(|(i, _)| *i);
+    Ok(out.into_iter().map(|(_, v)| v).collect())
 }
 
 #[cfg(test)]
@@ -500,6 +568,7 @@ mod tests {
                 id.to_string(),
                 "bkt".to_string(),
                 paths.clone(),
+                8,
             )
         };
         let views = open("s3-first").await.unwrap();
